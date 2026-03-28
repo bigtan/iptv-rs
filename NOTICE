@@ -1,0 +1,28 @@
+iptv-rs
+Copyright (C) 2026 contributors to iptv-rs.
+
+This project is maintained as an independent derivative of
+https://github.com/yujincheng08/rust-iptv-proxy and remains distributed
+under the GNU Affero General Public License v3.0. See LICENSE.
+
+This project also contains ideas, structure, protocol handling approaches,
+or adapted code influenced by the following upstream projects:
+
+- rozhuk-im/msd_lite
+  Copyright (c) 2011 - 2021 Rozhuk Ivan <rozhuk.im@gmail.com>
+  License: BSD-2-Clause
+
+- yujincheng08/rust-iptv-proxy
+  Copyright (C) 2022 yujincheng08
+  License: GNU Affero General Public License v3.0
+
+- yujincheng08/retina
+  Copyright (c) 2021 Scott Lamb <slamb@slamb.org>
+  License metadata: MIT OR Apache-2.0
+
+- scottlamb/retina
+  Copyright (c) 2021 Scott Lamb <slamb@slamb.org>
+  License: MIT OR Apache-2.0
+
+See THIRD_PARTY_NOTICES.md for repository links, attribution details, and
+the license files retained by this project.
