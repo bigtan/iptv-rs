@@ -28,7 +28,7 @@ jobs:
           profile: release
           targets: ${{ matrix.target }}
       - name: Upload binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: iptv-${{ matrix.target }}
           path: |
