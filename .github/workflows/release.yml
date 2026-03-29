@@ -33,7 +33,7 @@ jobs:
           set -e
           zip "iptv-${{ matrix.target }}.zip" "target/${{ matrix.target }}/release/iptv"
       - name: Upload zipped binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: iptv-${{ matrix.target }}
           path: |
