@@ -38,12 +38,12 @@ jobs:
           cp "target/${{ matrix.target }}/release/iptv-rs" "dist/iptv-rs"
           (
             cd dist
-            zip "../iptv-${{ matrix.target }}.zip" "iptv-rs"
+            zip "../iptv-rs-${{ matrix.target }}.zip" "iptv-rs"
           )
       - name: Upload zipped binary
         uses: actions/upload-artifact@v7
         with:
-          name: iptv-${{ matrix.target }}
+          name: iptv-rs-${{ matrix.target }}
           path: |
             iptv-${{ matrix.target }}.zip
           retention-days: 7

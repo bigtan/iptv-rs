@@ -30,7 +30,7 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
-          name: iptv-${{ matrix.target }}
+          name: iptv-rs-${{ matrix.target }}
           path: |
             target/${{ matrix.target }}/release/iptv-rs
           retention-days: 7
