@@ -45,7 +45,7 @@ jobs:
         with:
           name: iptv-rs-${{ matrix.target }}
           path: |
-            iptv-${{ matrix.target }}.zip
+            iptv-rs-${{ matrix.target }}.zip
           retention-days: 7
         
 
@@ -67,11 +67,12 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: dist
+          merge-multiple: true
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/**/*.zip
+            dist/*.zip
           body_path: RELEASE_NOTES.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
