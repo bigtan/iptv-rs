@@ -5,6 +5,9 @@ on:
     tags:
       - '*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build (${{ matrix.target }})
@@ -31,9 +34,14 @@ jobs:
         shell: bash
         run: |
           set -e
-          zip "iptv-${{ matrix.target }}.zip" "target/${{ matrix.target }}/release/iptv"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/iptv-rs" "dist/iptv-rs"
+          (
+            cd dist
+            zip "../iptv-${{ matrix.target }}.zip" "iptv-rs"
+          )
       - name: Upload zipped binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: iptv-${{ matrix.target }}
           path: |
@@ -56,7 +64,7 @@ jobs:
         with:
           args: --latest --output RELEASE_NOTES.md
       - name: Download all zipped binaries
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: dist
       - name: Create Release

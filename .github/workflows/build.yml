@@ -2,9 +2,9 @@ name: Build Rust Project
 
 on:
   push:
-    branches: [ master ]
+    branches: [ main ]
   pull_request:
-    branches: [ master ]
+    branches: [ main ]
 
 jobs:
   build:
@@ -28,10 +28,10 @@ jobs:
           profile: release
           targets: ${{ matrix.target }}
       - name: Upload binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: iptv-${{ matrix.target }}
           path: |
-            target/${{ matrix.target }}/release/iptv
+            target/${{ matrix.target }}/release/iptv-rs
           retention-days: 7
     
