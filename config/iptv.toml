@@ -29,7 +29,12 @@ replace = "CCTV4"
 
 [[alias.rules]]
 type = "regex"
-pattern = "(?i)^CCTV[-\\s]*(\\d{1,2}(\\s*P(LUS)?|[K\\+])?).*"
+pattern = "(?i)^CCTV\\s*[-\\s]*\\s*5(?:\\s*(?:[+＋]|P(?:LUS)?)).*$"
+replace = "CCTV5+"
+
+[[alias.rules]]
+type = "regex"
+pattern = "(?i)^CCTV[-\\s]*(\\d{1,2}(?:\\s*K)?).*"
 replace = "CCTV$1"
 
 [[alias.rules]]

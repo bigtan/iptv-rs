@@ -421,3 +421,64 @@ pub(crate) fn resolve_group_for_alias(
     }
     default_group.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::apply_alias;
+    use crate::config::{compile_config, Config};
+
+    fn sample_config() -> Config {
+        toml::from_str(
+            r#"
+[alias]
+mode = "first_match"
+
+[[alias.rules]]
+type = "regex"
+pattern = "(?i)^CCTV\\s*[-\\s]*\\s*4K.*$"
+replace = "CCTV4K"
+
+[[alias.rules]]
+type = "regex"
+pattern = "(?i)^CCTV\\s*[-\\s]*\\s*4.*$"
+replace = "CCTV4"
+
+[[alias.rules]]
+type = "regex"
+pattern = "(?i)^CCTV\\s*[-\\s]*\\s*5(?:\\s*(?:[+＋]|P(?:LUS)?)).*$"
+replace = "CCTV5+"
+
+[[alias.rules]]
+type = "regex"
+pattern = "(?i)^CCTV[-\\s]*(\\d{1,2}(?:\\s*K)?).*"
+replace = "CCTV$1"
+
+[[alias.rules]]
+type = "regex"
+pattern = "(?i)^(.+?)(?:[-\\s]|高清|超清|超高清|4K|[25]0P|时移|专用|测试)*$"
+replace = "$1"
+"#,
+        )
+        .expect("sample config should parse")
+    }
+
+    #[test]
+    fn cctv5_and_cctv5_plus_stay_distinct() {
+        let config = sample_config();
+        let compiled = compile_config(&config).expect("config should compile");
+
+        assert_eq!(apply_alias("CCTV5体育高清-测试", &config, &compiled), "CCTV5");
+        assert_eq!(
+            apply_alias("CCTV5+体育高清-测试", &config, &compiled),
+            "CCTV5+"
+        );
+        assert_eq!(
+            apply_alias("CCTV5＋体育高清-测试", &config, &compiled),
+            "CCTV5+"
+        );
+        assert_eq!(
+            apply_alias("CCTV5 PLUS体育高清-测试", &config, &compiled),
+            "CCTV5+"
+        );
+    }
+}
