@@ -1,7 +1,9 @@
 use actix_web::{
-    App, HttpRequest, HttpResponse, HttpServer, Responder, get, post,
+    App, HttpRequest, HttpResponse, HttpServer, Responder,
     cookie::{Cookie, SameSite},
+    get,
     http::header,
+    post,
     web::{Bytes, Data, Path, Query},
 };
 use anyhow::{Result, anyhow};
@@ -67,10 +69,15 @@ fn extract_token(req: &HttpRequest) -> Option<String> {
     if let Some(token) = extract_explicit_token(req) {
         return Some(token);
     }
-    req.cookie(AUTH_COOKIE_NAME).map(|cookie| cookie.value().to_string())
+    req.cookie(AUTH_COOKIE_NAME)
+        .map(|cookie| cookie.value().to_string())
 }
 
-fn maybe_auth_cookie(req: &HttpRequest, config: &Config, endpoint: &str) -> Option<Cookie<'static>> {
+fn maybe_auth_cookie(
+    req: &HttpRequest,
+    config: &Config,
+    endpoint: &str,
+) -> Option<Cookie<'static>> {
     if !should_protect(config, endpoint) || config.auth.token.is_empty() {
         return None;
     }
@@ -122,7 +129,7 @@ mod args;
 use args::{Args, EffectiveArgs};
 
 mod iptv;
-use iptv::{Channel, get_channels, get_icon};
+use iptv::{Channel, get_channel_list_raw, get_channels, get_icon};
 
 mod proxy;
 mod rtsp_client;
@@ -159,6 +166,7 @@ struct AppState {
     xmltv_cache: Mutex<HashMap<String, CachedText>>,
     manage_json_cache: Mutex<HashMap<String, CachedText>>,
     manage_html_cache: Mutex<HashMap<String, CachedText>>,
+    manage_raw_cache: Mutex<HashMap<String, CachedText>>,
     runtime: RwLock<RuntimeConfig>,
 }
 
@@ -228,8 +236,7 @@ fn spawn_shared_proxy_task<S>(
     key: String,
     hub: Arc<SharedProxyHub>,
     stream: S,
-)
-where
+) where
     S: Stream<Item = Result<Bytes>> + Send + 'static,
 {
     tokio::spawn(async move {
@@ -290,13 +297,17 @@ fn subscribe_shared_udp(
 
     let permit = match state.proxy_slots.clone().try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => return Err(HttpResponse::ServiceUnavailable().body("Too many active proxy streams")),
+        Err(_) => {
+            return Err(HttpResponse::ServiceUnavailable().body("Too many active proxy streams"));
+        }
     };
     let hub = Arc::new(SharedProxyHub::new());
     {
         let mut shared = match state.shared_proxies.lock() {
             Ok(shared) => shared,
-            Err(_) => return Err(HttpResponse::InternalServerError().body("Shared proxy lock poisoned")),
+            Err(_) => {
+                return Err(HttpResponse::InternalServerError().body("Shared proxy lock poisoned"));
+            }
         };
         if let Some(existing) = shared.get(&key).cloned() {
             return Ok(existing.subscribe());
@@ -566,7 +577,11 @@ impl SharedProxyHub {
         let next_seq = match self.inner.lock() {
             Ok(mut inner) => {
                 inner.receivers += 1;
-                inner.chunks.front().map(|(seq, _)| *seq).unwrap_or(inner.next_seq)
+                inner
+                    .chunks
+                    .front()
+                    .map(|(seq, _)| *seq)
+                    .unwrap_or(inner.next_seq)
             }
             Err(_) => 0,
         };
@@ -615,7 +630,11 @@ impl SharedProxyReceiver {
         loop {
             let notified = self.hub.notify.notified();
             {
-                let inner = self.hub.inner.lock().map_err(|_| SharedProxyRecvError::Closed)?;
+                let inner = self
+                    .hub
+                    .inner
+                    .lock()
+                    .map_err(|_| SharedProxyRecvError::Closed)?;
                 if let Some((first_seq, _)) = inner.chunks.front()
                     && self.next_seq < *first_seq
                 {
@@ -623,7 +642,8 @@ impl SharedProxyReceiver {
                     self.next_seq = *first_seq;
                     return Err(SharedProxyRecvError::Lagged(lagged));
                 }
-                if let Some((_, bytes)) = inner.chunks.iter().find(|(seq, _)| *seq == self.next_seq) {
+                if let Some((_, bytes)) = inner.chunks.iter().find(|(seq, _)| *seq == self.next_seq)
+                {
                     self.next_seq += 1;
                     return Ok(bytes.clone());
                 }
@@ -872,7 +892,9 @@ async fn rtsp(
             },
             None => match to_xmltv_time(Local::now().timestamp_millis()) {
                 Ok(end) => end,
-                Err(_) => return HttpResponse::InternalServerError().body("Failed to format local time"),
+                Err(_) => {
+                    return HttpResponse::InternalServerError().body("Failed to format local time");
+                }
             },
         };
         param = format!("{}&playseek={}-{}", param, start, end);
@@ -1018,6 +1040,7 @@ async fn manage_index(state: Data<AppState>, req: HttpRequest) -> impl Responder
           <div class="d-flex gap-2 mt-3">
             <a href="/manage/channels/html?limit=200" class="btn btn-warning btn-sm">Interactive UI</a>
             <a href="/manage/channels?limit=200" class="btn btn-outline-warning btn-sm">JSON</a>
+            <a href="/manage/channels/raw" class="btn btn-outline-dark btn-sm">Raw</a>
           </div>
         </div>
       </div>
@@ -1123,7 +1146,15 @@ async fn manage_reload(state: Data<AppState>, req: HttpRequest) -> impl Responde
     if let Ok(mut cache) = state.manage_html_cache.lock() {
         cache.clear();
     }
-    with_auth_cookie(&req, &runtime.config, "manage", HttpResponse::Ok().body("OK"))
+    if let Ok(mut cache) = state.manage_raw_cache.lock() {
+        cache.clear();
+    }
+    with_auth_cookie(
+        &req,
+        &runtime.config,
+        "manage",
+        HttpResponse::Ok().body("OK"),
+    )
 }
 
 #[get("/manage/test")]
@@ -1215,7 +1246,13 @@ async fn manage_channels(
         Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
     };
     let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok());
-    let cache_key = format!("{}|{}|{}|{}", scheme, host, is_kodi, limit.unwrap_or(usize::MAX));
+    let cache_key = format!(
+        "{}|{}|{}|{}",
+        scheme,
+        host,
+        is_kodi,
+        limit.unwrap_or(usize::MAX)
+    );
     if let Some(text) = get_cached_text(&state.manage_json_cache, &cache_key) {
         let runtime = match state.runtime.read() {
             Ok(guard) => guard,
@@ -1230,7 +1267,8 @@ async fn manage_channels(
                 .body(text),
         );
     }
-    let mut entries = build_local_entries(channels, &state.args, &scheme, &host, playseek, 0, limit);
+    let mut entries =
+        build_local_entries(channels, &state.args, &scheme, &host, playseek, 0, limit);
     if !state.args.extra_playlist.is_empty() && limit.is_none_or(|limit| entries.len() < limit) {
         let mut set = JoinSet::new();
         for (i, u) in state.args.extra_playlist.iter().enumerate() {
@@ -1271,7 +1309,9 @@ async fn manage_channels(
         compiled: &runtime.compiled,
     };
     let mut entries = finalize_entries(entries, &ctx);
-    if let Some(limit) = limit && entries.len() > limit {
+    if let Some(limit) = limit
+        && entries.len() > limit
+    {
         entries.truncate(limit);
     }
     match serde_json::to_string_pretty(&entries) {
@@ -1288,6 +1328,63 @@ async fn manage_channels(
         }
         Err(e) => HttpResponse::InternalServerError().body(format!("Error: {}", e)),
     }
+}
+
+#[get("/manage/channels/raw")]
+async fn manage_channels_raw(state: Data<AppState>, req: HttpRequest) -> impl Responder {
+    let (enabled, need_auth) = match state.runtime.read() {
+        Ok(guard) => (
+            guard.config.manage.enabled,
+            check_auth(&req, &guard.config, "manage"),
+        ),
+        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
+    };
+    if !enabled {
+        return HttpResponse::NotFound().body("Manage disabled");
+    }
+    if !need_auth {
+        return HttpResponse::Unauthorized().body("Unauthorized");
+    }
+    let cache_key = String::from("raw");
+    if let Some(text) = get_cached_text(&state.manage_raw_cache, &cache_key) {
+        let runtime = match state.runtime.read() {
+            Ok(guard) => guard,
+            Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
+        };
+        return with_auth_cookie(
+            &req,
+            &runtime.config,
+            "manage",
+            HttpResponse::Ok()
+                .insert_header((header::CONTENT_TYPE, "text/plain; charset=utf-8"))
+                .insert_header((
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"channellist-raw.txt\"",
+                ))
+                .body(text),
+        );
+    }
+    let text = match get_channel_list_raw(&state.args).await {
+        Ok(text) => text,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
+    };
+    put_cached_text(&state.manage_raw_cache, cache_key, text.clone());
+    let runtime = match state.runtime.read() {
+        Ok(guard) => guard,
+        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
+    };
+    with_auth_cookie(
+        &req,
+        &runtime.config,
+        "manage",
+        HttpResponse::Ok()
+            .insert_header((header::CONTENT_TYPE, "text/plain; charset=utf-8"))
+            .insert_header((
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"channellist-raw.txt\"",
+            ))
+            .body(text),
+    )
 }
 
 #[get("/manage/channels/html")]
@@ -1327,7 +1424,13 @@ async fn manage_channels_html(
         Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
     };
     let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok());
-    let cache_key = format!("{}|{}|{}|{}", scheme, host, is_kodi, limit.unwrap_or(usize::MAX));
+    let cache_key = format!(
+        "{}|{}|{}|{}",
+        scheme,
+        host,
+        is_kodi,
+        limit.unwrap_or(usize::MAX)
+    );
     if let Some(html) = get_cached_text(&state.manage_html_cache, &cache_key) {
         let runtime = match state.runtime.read() {
             Ok(guard) => guard,
@@ -1342,7 +1445,8 @@ async fn manage_channels_html(
                 .body(html),
         );
     }
-    let mut entries = build_local_entries(channels, &state.args, &scheme, &host, playseek, 0, limit);
+    let mut entries =
+        build_local_entries(channels, &state.args, &scheme, &host, playseek, 0, limit);
     if !state.args.extra_playlist.is_empty() && limit.is_none_or(|limit| entries.len() < limit) {
         let mut set = JoinSet::new();
         for (i, u) in state.args.extra_playlist.iter().enumerate() {
@@ -1383,7 +1487,9 @@ async fn manage_channels_html(
         compiled: &runtime.compiled,
     };
     let mut entries = finalize_entries(entries, &ctx);
-    if let Some(limit) = limit && entries.len() > limit {
+    if let Some(limit) = limit
+        && entries.len() > limit
+    {
         entries.truncate(limit);
     }
 
@@ -1479,6 +1585,7 @@ async fn manage_channels_html(
       </div>
       <div>
         <a href="/manage/channels" class="btn btn-outline-secondary btn-sm"><i class="bi bi-filetype-json me-1"></i>Export JSON</a>
+        <a href="/manage/channels/raw" class="btn btn-outline-primary btn-sm ms-2"><i class="bi bi-download me-1"></i>Download Raw</a>
       </div>
     </div>
   </div>
@@ -1722,6 +1829,7 @@ async fn status(state: Data<AppState>, req: HttpRequest) -> impl Responder {
             <ul class="list-unstyled mb-0">
               <li class="mb-2"><a href="/manage" class="text-decoration-none"><i class="bi bi-speedometer2 me-2"></i>Management Dashboard</a></li>
               <li class="mb-2"><a href="/manage/config" class="text-decoration-none"><i class="bi bi-file-earmark-code me-2"></i>View Raw Config</a></li>
+              <li class="mb-2"><a href="/manage/channels/raw" class="text-decoration-none"><i class="bi bi-download me-2"></i>Download Raw ChannelList</a></li>
               <li><a href="/manage/channels/html" class="text-decoration-none"><i class="bi bi-list-ul me-2"></i>Interactive Channel List</a></li>
             </ul>
           </div>
@@ -1766,7 +1874,8 @@ async fn udp(state: Data<AppState>, addr: Path<String>) -> impl Responder {
         Ok(addr) => addr,
         Err(e) => return HttpResponse::BadRequest().body(format!("Error: {}", e)),
     };
-    let mut receiver = match subscribe_shared_udp(state.clone(), addr, state.args.interface.clone()) {
+    let mut receiver = match subscribe_shared_udp(state.clone(), addr, state.args.interface.clone())
+    {
         Ok(receiver) => receiver,
         Err(response) => return response,
     };
@@ -1836,6 +1945,7 @@ async fn main() -> std::io::Result<()> {
         xmltv_cache: Mutex::new(HashMap::new()),
         manage_json_cache: Mutex::new(HashMap::new()),
         manage_html_cache: Mutex::new(HashMap::new()),
+        manage_raw_cache: Mutex::new(HashMap::new()),
         runtime: RwLock::new(RuntimeConfig {
             config,
             compiled,
@@ -1857,6 +1967,7 @@ async fn main() -> std::io::Result<()> {
             .service(manage_reload)
             .service(manage_test)
             .service(manage_channels)
+            .service(manage_channels_raw)
             .service(manage_channels_html)
             .app_data(state.clone())
     })

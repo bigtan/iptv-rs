@@ -425,7 +425,7 @@ pub(crate) fn resolve_group_for_alias(
 #[cfg(test)]
 mod tests {
     use super::apply_alias;
-    use crate::config::{compile_config, Config};
+    use crate::config::{Config, compile_config};
 
     fn sample_config() -> Config {
         toml::from_str(
@@ -467,7 +467,10 @@ replace = "$1"
         let config = sample_config();
         let compiled = compile_config(&config).expect("config should compile");
 
-        assert_eq!(apply_alias("CCTV5体育高清-测试", &config, &compiled), "CCTV5");
+        assert_eq!(
+            apply_alias("CCTV5体育高清-测试", &config, &compiled),
+            "CCTV5"
+        );
         assert_eq!(
             apply_alias("CCTV5+体育高清-测试", &config, &compiled),
             "CCTV5+"

@@ -77,7 +77,12 @@ impl RtspClient {
     pub(crate) async fn describe_and_setup(&mut self) -> Result<()> {
         let request_url = self.request_url.to_string();
         let describe = self
-            .request("DESCRIBE", &request_url, &[("Accept", "application/sdp")], None)
+            .request(
+                "DESCRIBE",
+                &request_url,
+                &[("Accept", "application/sdp")],
+                None,
+            )
             .await?;
         let body = String::from_utf8(describe.body).context("invalid SDP body")?;
         let content_base = describe
@@ -98,7 +103,11 @@ impl RtspClient {
         );
 
         for (index, track) in presentation.tracks.iter().enumerate() {
-            let interleaved = format!("RTP/AVP/TCP;unicast;interleaved={}-{}", index * 2, index * 2 + 1);
+            let interleaved = format!(
+                "RTP/AVP/TCP;unicast;interleaved={}-{}",
+                index * 2,
+                index * 2 + 1
+            );
             let _ = self
                 .request("SETUP", track, &[("Transport", interleaved.as_str())], None)
                 .await?;
@@ -194,10 +203,7 @@ impl RtspClient {
                 };
 
                 let kind = parse_auth_challenge(&www_auth)?;
-                self.auth = Some(AuthState {
-                    kind,
-                    ..current
-                });
+                self.auth = Some(AuthState { kind, ..current });
 
                 let retry = self
                     .request_inner(method, &current_uri, headers, body)
@@ -261,7 +267,8 @@ impl RtspClient {
         let cseq = self.cseq;
         self.cseq += 1;
 
-        let mut req = format!("{method} {uri} RTSP/1.0\r\nCSeq: {cseq}\r\nUser-Agent: rust-iptv-proxy\r\n");
+        let mut req =
+            format!("{method} {uri} RTSP/1.0\r\nCSeq: {cseq}\r\nUser-Agent: rust-iptv-proxy\r\n");
         if let Some(session) = self.session.as_deref() {
             req.push_str(&format!("Session: {session}\r\n"));
         }
@@ -350,7 +357,9 @@ impl RtspClient {
         let header_bytes = &self.read_buf[self.read_pos..self.read_pos + header_end];
         let header_text = String::from_utf8_lossy(header_bytes);
         let mut lines = header_text.split("\r\n");
-        let status_line = lines.next().ok_or_else(|| anyhow!("missing RTSP status line"))?;
+        let status_line = lines
+            .next()
+            .ok_or_else(|| anyhow!("missing RTSP status line"))?;
         let mut parts = status_line.splitn(3, ' ');
         let proto = parts.next().unwrap_or_default();
         if !proto.starts_with("RTSP/") {
@@ -512,7 +521,11 @@ struct SdpPresentation {
     tracks: Vec<String>,
 }
 
-fn parse_sdp_presentation(body: &str, request_url: &Url, content_base: &str) -> Result<SdpPresentation> {
+fn parse_sdp_presentation(
+    body: &str,
+    request_url: &Url,
+    content_base: &str,
+) -> Result<SdpPresentation> {
     let base = Url::parse(content_base).unwrap_or_else(|_| request_url.clone());
     let mut presentation_control = resolve_control_url(&base, request_url, "*")?;
     let mut tracks = Vec::new();
@@ -667,7 +680,10 @@ fn build_auth_header(auth: &mut AuthState, method: &str, uri: &str) -> String {
         AuthKind::Digest(challenge) => {
             auth.nonce_count += 1;
             let nc = format!("{:08x}", auth.nonce_count);
-            let cnonce = format!("{:x}", md5_compute(format!("{method}:{uri}:{nc}:{}", auth.username)));
+            let cnonce = format!(
+                "{:x}",
+                md5_compute(format!("{method}:{uri}:{nc}:{}", auth.username))
+            );
             let qop = challenge
                 .qop
                 .as_deref()
@@ -675,12 +691,18 @@ fn build_auth_header(auth: &mut AuthState, method: &str, uri: &str) -> String {
                 .unwrap_or("auth");
             let ha1 = format!(
                 "{:x}",
-                md5_compute(format!("{}:{}:{}", auth.username, challenge.realm, auth.password))
+                md5_compute(format!(
+                    "{}:{}:{}",
+                    auth.username, challenge.realm, auth.password
+                ))
             );
             let ha2 = format!("{:x}", md5_compute(format!("{method}:{uri}")));
             let response = format!(
                 "{:x}",
-                md5_compute(format!("{ha1}:{}:{nc}:{cnonce}:{qop}:{ha2}", challenge.nonce))
+                md5_compute(format!(
+                    "{ha1}:{}:{nc}:{cnonce}:{qop}:{ha2}",
+                    challenge.nonce
+                ))
             );
 
             let mut header = format!(

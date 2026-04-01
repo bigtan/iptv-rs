@@ -64,6 +64,70 @@ async fn get_base_url(client: &Client, args: &EffectiveArgs) -> Result<String> {
     Ok(base_url)
 }
 
+async fn fetch_channellist_raw(
+    client: &Client,
+    args: &EffectiveArgs,
+    base_url: &str,
+) -> Result<String> {
+    let user = args.user.as_str();
+    let passwd = args.passwd.as_str();
+    let mac = args.mac.as_str();
+    let imei = args.imei.as_str();
+    let ip = args.address.as_str();
+
+    let params = [
+        ("response_type", "EncryToken"),
+        ("client_id", "smcphone"),
+        ("userid", user),
+    ];
+    let url = reqwest::Url::parse_with_params(
+        format!("{base_url}/EPG/oauth/v2/authorize").as_str(),
+        params,
+    )?;
+    let response = client.get(url).send().await?.error_for_status()?;
+
+    let token = response.json::<TokenJson>().await?.encry_token;
+
+    debug!("Got token {token}");
+
+    let md5_hex = format!("{:X}", md5::compute(passwd.as_bytes()));
+    let enc = ecb::Encryptor::<TdesEde3>::new_from_slice(&md5_hex.as_bytes()[0..24]);
+    let enc = match enc {
+        Ok(enc) => Ok(enc),
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("Encrpy error {e}"),
+        )),
+    }?;
+    let data = format!(
+        "{}${token}${user}${imei}${ip}${mac}$$CTC",
+        rand::random_range(0..10000000),
+    );
+    let auth = hex::encode_upper(enc.encrypt_padded_vec_mut::<Pkcs7>(data.as_bytes()));
+
+    debug!("Got auth {auth}");
+
+    let params = [
+        ("client_id", "smcphone"),
+        ("DeviceType", "deviceType"),
+        ("UserID", user),
+        ("DeviceVersion", "deviceVersion"),
+        ("userdomain", "2"),
+        ("datadomain", "3"),
+        ("accountType", "1"),
+        ("authinfo", auth.as_str()),
+        ("grant_type", "EncryToken"),
+    ];
+    let url =
+        reqwest::Url::parse_with_params(format!("{base_url}/EPG/oauth/v2/token").as_str(), params)?;
+    let _response = client.get(url).send().await?.error_for_status()?;
+
+    let url = reqwest::Url::parse(format!("{base_url}/EPG/jsp/getchannellistHWCTC.jsp").as_str())?;
+    let response = client.get(url).send().await?.error_for_status()?;
+
+    response.text().await.map_err(Into::into)
+}
+
 pub(crate) struct Program {
     pub(crate) start: i64,
     pub(crate) stop: i64,
@@ -114,68 +178,9 @@ pub(crate) async fn get_channels(
 ) -> Result<Vec<Channel>> {
     info!("Obtaining channels");
 
-    let user = args.user.as_str();
-    let passwd = args.passwd.as_str();
-    let mac = args.mac.as_str();
-    let imei = args.imei.as_str();
-    let ip = args.address.as_str();
-
     let client = get_client_with_if(args.interface.as_deref())?;
-
     let base_url = get_base_url(&client, args).await?;
-
-    let params = [
-        ("response_type", "EncryToken"),
-        ("client_id", "smcphone"),
-        ("userid", user),
-    ];
-    let url = reqwest::Url::parse_with_params(
-        format!("{base_url}/EPG/oauth/v2/authorize").as_str(),
-        params,
-    )?;
-    let response = client.get(url).send().await?.error_for_status()?;
-
-    let token = response.json::<TokenJson>().await?.encry_token;
-
-    debug!("Got token {token}");
-
-    let md5_hex = format!("{:X}", md5::compute(passwd.as_bytes()));
-    let enc = ecb::Encryptor::<TdesEde3>::new_from_slice(&md5_hex.as_bytes()[0..24]);
-    let enc = match enc {
-        Ok(enc) => Ok(enc),
-        Err(e) => Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!("Encrpy error {e}"),
-        )),
-    }?;
-    let data = format!(
-        "{}${token}${user}${imei}${ip}${mac}$$CTC",
-        rand::random_range(0..10000000),
-    );
-    let auth = hex::encode_upper(enc.encrypt_padded_vec_mut::<Pkcs7>(data.as_bytes()));
-
-    debug!("Got auth {auth}");
-
-    let params = [
-        ("client_id", "smcphone"),
-        ("DeviceType", "deviceType"),
-        ("UserID", user),
-        ("DeviceVersion", "deviceVersion"),
-        ("userdomain", "2"),
-        ("datadomain", "3"),
-        ("accountType", "1"),
-        ("authinfo", auth.as_str()),
-        ("grant_type", "EncryToken"),
-    ];
-    let url =
-        reqwest::Url::parse_with_params(format!("{base_url}/EPG/oauth/v2/token").as_str(), params)?;
-    let _response = client.get(url).send().await?.error_for_status()?;
-
-    let url = reqwest::Url::parse(format!("{base_url}/EPG/jsp/getchannellistHWCTC.jsp").as_str())?;
-
-    let response = client.get(url).send().await?.error_for_status()?;
-
-    let res = response.text().await?;
+    let res = fetch_channellist_raw(&client, args, &base_url).await?;
     let re = Regex::new("Authentication.CTCSetConfig\\('Channel','(.+?)'\\)")?;
     let mut channels = re
         .captures_iter(&res)
@@ -289,6 +294,12 @@ pub(crate) async fn get_channels(
     }
 
     Ok(channels)
+}
+
+pub(crate) async fn get_channel_list_raw(args: &EffectiveArgs) -> Result<String> {
+    let client = get_client_with_if(args.interface.as_deref())?;
+    let base_url = get_base_url(&client, args).await?;
+    fetch_channellist_raw(&client, args, &base_url).await
 }
 
 pub(crate) async fn get_icon(args: &EffectiveArgs, id: &str) -> Result<Vec<u8>> {
