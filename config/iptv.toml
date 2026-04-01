@@ -14,6 +14,12 @@ protect = ["playlist", "xmltv", "manage"]
 [manage]
 enabled = true
 
+[fcc]
+enabled = true
+signaling_timeout_ms = 80
+unicast_idle_timeout_ms = 1000
+max_redirects = 5
+
 [alias]
 mode = "first_match"
 

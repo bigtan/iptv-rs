@@ -53,4 +53,8 @@ pub(crate) struct EffectiveArgs {
     pub(crate) extra_xmltv: Vec<String>,
     pub(crate) udp_proxy: bool,
     pub(crate) rtsp_proxy: bool,
+    pub(crate) fcc_enabled: bool,
+    pub(crate) fcc_signaling_timeout_ms: u64,
+    pub(crate) fcc_unicast_idle_timeout_ms: u64,
+    pub(crate) fcc_max_redirects: usize,
 }

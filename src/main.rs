@@ -131,6 +131,7 @@ use args::{Args, EffectiveArgs};
 mod iptv;
 use iptv::{Channel, get_channel_list_raw, get_channels, get_icon};
 
+mod fcc;
 mod proxy;
 mod rtsp_client;
 
@@ -139,6 +140,7 @@ use config::{
     CompiledConfig, Config, ManageTestResult, build_templates, compile_config, load_config,
     should_protect,
 };
+use fcc::{FccOptions, parse_fcc_server};
 
 mod playlist;
 use playlist::{
@@ -205,8 +207,9 @@ const SHARED_PROXY_BUFFER: usize = 512;
 const SHARED_PROXY_BATCH_FLUSH: Duration = Duration::from_millis(2);
 const OUTPUT_CACHE_TTL: Duration = Duration::from_secs(5);
 
-fn shared_udp_key(addr: &SocketAddrV4, if_name: Option<&str>) -> String {
-    format!("udp|{}|{}", if_name.unwrap_or(""), addr)
+fn shared_udp_key(addr: &SocketAddrV4, if_name: Option<&str>, fcc: Option<&FccOptions>) -> String {
+    let fcc_server = fcc.map(|fcc| fcc.server.to_string()).unwrap_or_default();
+    format!("udp|{}|{}|{}", if_name.unwrap_or(""), addr, fcc_server)
 }
 
 fn get_cached_text(cache: &Mutex<HashMap<String, CachedText>>, key: &str) -> Option<String> {
@@ -287,11 +290,20 @@ fn subscribe_shared_udp(
     state: Data<AppState>,
     addr: SocketAddrV4,
     if_name: Option<String>,
+    fcc: Option<FccOptions>,
 ) -> Result<SharedProxyReceiver, HttpResponse> {
-    let key = shared_udp_key(&addr, if_name.as_deref());
+    let key = shared_udp_key(&addr, if_name.as_deref(), fcc.as_ref());
+    debug!(
+        "Subscribe shared UDP key={} multicast={} interface={:?} fcc={:?}",
+        key,
+        addr,
+        if_name,
+        fcc.as_ref().map(|v| v.server)
+    );
     if let Ok(shared) = state.shared_proxies.lock()
         && let Some(hub) = shared.get(&key)
     {
+        debug!("Reusing shared UDP hub for key={}", key);
         return Ok(hub.subscribe());
     }
 
@@ -310,11 +322,12 @@ fn subscribe_shared_udp(
             }
         };
         if let Some(existing) = shared.get(&key).cloned() {
+            debug!("Shared UDP hub appeared during setup for key={}", key);
             return Ok(existing.subscribe());
         }
         shared.insert(key.clone(), Arc::clone(&hub));
     }
-    let stream = proxy::udp_source(addr, if_name, permit);
+    let stream = proxy::udp_source(addr, if_name, fcc, permit);
     let receiver = hub.subscribe();
     spawn_shared_proxy_task(state, key, hub, stream);
     Ok(receiver)
@@ -710,6 +723,10 @@ fn build_effective_args(args: &Args, config: &Config) -> Result<EffectiveArgs> {
         extra_xmltv: args.extra_xmltv.clone(),
         udp_proxy: args.udp_proxy || app.udp_proxy,
         rtsp_proxy: args.rtsp_proxy || app.rtsp_proxy,
+        fcc_enabled: config.fcc.enabled,
+        fcc_signaling_timeout_ms: config.fcc.signaling_timeout_ms,
+        fcc_unicast_idle_timeout_ms: config.fcc.unicast_idle_timeout_ms,
+        fcc_max_redirects: config.fcc.max_redirects,
     })
 }
 
@@ -1868,17 +1885,50 @@ async fn status(state: Data<AppState>, req: HttpRequest) -> impl Responder {
 }
 
 #[get("/udp/{addr}")]
-async fn udp(state: Data<AppState>, addr: Path<String>) -> impl Responder {
+async fn udp(
+    state: Data<AppState>,
+    addr: Path<String>,
+    params: Query<BTreeMap<String, String>>,
+) -> impl Responder {
     let addr = &*addr;
     let addr = match SocketAddrV4::from_str(addr) {
         Ok(addr) => addr,
         Err(e) => return HttpResponse::BadRequest().body(format!("Error: {}", e)),
     };
-    let mut receiver = match subscribe_shared_udp(state.clone(), addr, state.args.interface.clone())
-    {
-        Ok(receiver) => receiver,
-        Err(response) => return response,
+    let fcc = match params.get("fcc") {
+        Some(value) => match parse_fcc_server(value) {
+            Ok(server) if state.args.fcc_enabled => {
+                debug!(
+                    "Parsed FCC query for multicast {}: server={}, signaling_timeout={}ms, unicast_idle_timeout={}ms, max_redirects={}",
+                    addr,
+                    server,
+                    state.args.fcc_signaling_timeout_ms,
+                    state.args.fcc_unicast_idle_timeout_ms,
+                    state.args.fcc_max_redirects
+                );
+                Some(FccOptions {
+                    server,
+                    signaling_timeout_ms: state.args.fcc_signaling_timeout_ms,
+                    unicast_idle_timeout_ms: state.args.fcc_unicast_idle_timeout_ms,
+                    max_redirects: state.args.fcc_max_redirects,
+                })
+            }
+            Ok(server) => {
+                debug!(
+                    "Ignoring FCC query for multicast {} because FCC is disabled: server={}",
+                    addr, server
+                );
+                None
+            }
+            Err(e) => return HttpResponse::BadRequest().body(format!("Invalid fcc query: {}", e)),
+        },
+        None => None,
     };
+    let mut receiver =
+        match subscribe_shared_udp(state.clone(), addr, state.args.interface.clone(), fcc) {
+            Ok(receiver) => receiver,
+            Err(response) => return response,
+        };
     HttpResponse::Ok().streaming(stream! {
         loop {
             match receiver.recv().await {
@@ -1928,6 +1978,17 @@ async fn main() -> std::io::Result<()> {
             exit(1);
         }
     };
+    debug!(
+        "Effective runtime config bind={} interface={:?} udp_proxy={} rtsp_proxy={} fcc_enabled={} fcc_signaling_timeout_ms={} fcc_unicast_idle_timeout_ms={} fcc_max_redirects={}",
+        effective_args.bind,
+        effective_args.interface,
+        effective_args.udp_proxy,
+        effective_args.rtsp_proxy,
+        effective_args.fcc_enabled,
+        effective_args.fcc_signaling_timeout_ms,
+        effective_args.fcc_unicast_idle_timeout_ms,
+        effective_args.fcc_max_redirects
+    );
 
     let state = Data::new(AppState {
         args: effective_args.clone(),

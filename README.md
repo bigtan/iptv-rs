@@ -5,6 +5,7 @@
 It provides:
 - playlist and XMLTV aggregation
 - UDP multicast proxying
+- Telecom FCC bootstrap for `/udp/...?...` streams
 - RTSP replay/live proxying with a native Rust RTSP client
 - alias/group/resolution rules
 - lightweight management endpoints
@@ -46,6 +47,7 @@ Example file:
 Key sections:
 - `[app]`: login, bind address, proxy switches
 - `[auth]`: token protection
+- `[fcc]`: FCC enablement and timeout tuning
 - `[alias]`: alias rewrite rules
 - `[resolution]`: quality scoring rules
 - `[groups]`: channel grouping
@@ -64,7 +66,7 @@ Key sections:
 - `/manage/test?name=...`
 - `/manage/channels`
 - `/manage/channels/html`
-- `/udp/{ip}/{port}`
+- `/udp/{addr}?fcc=ip:port`
 - `/rtsp/{tail:.*}`
 
 ## Authentication

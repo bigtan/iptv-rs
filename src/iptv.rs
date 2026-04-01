@@ -213,6 +213,10 @@ pub(crate) async fn get_channels(
                     rtsp.map(|rtsp| (rtsp, igmp))
                 })
                 .map(|(rtsp, igmp)| {
+                    let fcc = m
+                        .get("ChannelFCCIP")
+                        .zip(m.get("ChannelFCCPort"))
+                        .map(|(ip, port)| format!("{ip}:{port}"));
                     (
                         if args.rtsp_proxy {
                             rtsp.replace("rtsp://", &format!("{}://{}/rtsp/", scheme, host))
@@ -222,11 +226,18 @@ pub(crate) async fn get_channels(
                         .replace("zoneoffset=0", "zoneoffset=480"),
                         igmp.map(|igmp| {
                             if args.udp_proxy {
-                                igmp.replace("igmp://", &format!("{}://{}/udp/", scheme, host))
+                                let mut proxied =
+                                    igmp.replace("igmp://", &format!("{}://{}/udp/", scheme, host));
+                                if let Some(fcc) = fcc.as_ref() {
+                                    proxied.push_str("?fcc=");
+                                    proxied.push_str(fcc);
+                                }
+                                proxied
                             } else {
                                 igmp.to_string()
                             }
                         }),
+                        fcc,
                     )
                 })
                 .map(|u| (i, n, u, m))
@@ -245,13 +256,18 @@ pub(crate) async fn get_channels(
                 }),
             )
         })
-        .map(|(i, n, (rtsp, igmp), time_shift_url)| Channel {
-            id: i,
-            name: n.to_owned(),
-            rtsp,
-            igmp,
-            epg: vec![],
-            time_shift_url,
+        .map(|(i, n, (rtsp, igmp, fcc), time_shift_url)| {
+            if let Some(fcc_addr) = fcc.as_ref() {
+                debug!("Channel {} ({}) detected FCC endpoint {}", i, n, fcc_addr);
+            }
+            Channel {
+                id: i,
+                name: n.to_owned(),
+                rtsp,
+                igmp,
+                epg: vec![],
+                time_shift_url,
+            }
         })
         .collect::<Vec<_>>();
 

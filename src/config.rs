@@ -9,6 +9,7 @@ use std::fs;
 #[derive(Default)]
 pub(crate) struct Config {
     pub(crate) app: AppConfig,
+    pub(crate) fcc: FccConfig,
     pub(crate) alias: AliasConfig,
     pub(crate) resolution: ResolutionConfig,
     pub(crate) groups: GroupConfig,
@@ -32,6 +33,26 @@ pub(crate) struct AppConfig {
     pub(crate) interface: Option<String>,
     pub(crate) rtsp_proxy: bool,
     pub(crate) udp_proxy: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct FccConfig {
+    pub(crate) enabled: bool,
+    pub(crate) signaling_timeout_ms: u64,
+    pub(crate) unicast_idle_timeout_ms: u64,
+    pub(crate) max_redirects: usize,
+}
+
+impl Default for FccConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            signaling_timeout_ms: 80,
+            unicast_idle_timeout_ms: 1000,
+            max_redirects: 5,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
