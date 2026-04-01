@@ -232,7 +232,7 @@ mod tests {
         packet[14..16].copy_from_slice(&15970u16.to_be_bytes());
         packet[20..24].copy_from_slice(&[10, 0, 0, 2]);
 
-        let response = parse_telecom_response(
+        let (response, _) = parse_telecom_response_with_meta(
             &packet,
             SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 12000),
         )

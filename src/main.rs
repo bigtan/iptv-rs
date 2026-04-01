@@ -1884,8 +1884,7 @@ async fn status(state: Data<AppState>, req: HttpRequest) -> impl Responder {
     )
 }
 
-#[get("/udp/{addr}")]
-async fn udp(
+async fn udp_like(
     state: Data<AppState>,
     addr: Path<String>,
     params: Query<BTreeMap<String, String>>,
@@ -1942,6 +1941,24 @@ async fn udp(
             }
         }
     })
+}
+
+#[get("/udp/{addr}")]
+async fn udp(
+    state: Data<AppState>,
+    addr: Path<String>,
+    params: Query<BTreeMap<String, String>>,
+) -> impl Responder {
+    udp_like(state, addr, params).await
+}
+
+#[get("/rtp/{addr}")]
+async fn rtp(
+    state: Data<AppState>,
+    addr: Path<String>,
+    params: Query<BTreeMap<String, String>>,
+) -> impl Responder {
+    udp_like(state, addr, params).await
 }
 
 #[actix_web::main] // or #[tokio::main]
@@ -2022,6 +2039,7 @@ async fn main() -> std::io::Result<()> {
             .service(logo)
             .service(rtsp)
             .service(udp)
+            .service(rtp)
             .service(status)
             .service(manage_index)
             .service(manage_config)

@@ -9,6 +9,7 @@ use local_ip_address::list_afinet_netifas;
 use log::{debug, info};
 use regex_lite::Regex;
 use reqwest::Client;
+use reqwest::Url;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -213,10 +214,9 @@ pub(crate) async fn get_channels(
                     rtsp.map(|rtsp| (rtsp, igmp))
                 })
                 .map(|(rtsp, igmp)| {
-                    let fcc = m
-                        .get("ChannelFCCIP")
-                        .zip(m.get("ChannelFCCPort"))
-                        .map(|(ip, port)| format!("{ip}:{port}"));
+                    let fcc = Url::parse(rtsp)
+                        .ok()
+                        .and_then(|url| url.host_str().map(|host| format!("{host}:8027")));
                     (
                         if args.rtsp_proxy {
                             rtsp.replace("rtsp://", &format!("{}://{}/rtsp/", scheme, host))
@@ -258,7 +258,10 @@ pub(crate) async fn get_channels(
         })
         .map(|(i, n, (rtsp, igmp, fcc), time_shift_url)| {
             if let Some(fcc_addr) = fcc.as_ref() {
-                debug!("Channel {} ({}) detected FCC endpoint {}", i, n, fcc_addr);
+                debug!(
+                    "Channel {} ({}) derived FCC endpoint {} from RTSP server",
+                    i, n, fcc_addr
+                );
             }
             Channel {
                 id: i,

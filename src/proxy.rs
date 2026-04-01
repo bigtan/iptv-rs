@@ -30,6 +30,12 @@ enum FccState {
     UnicastActive,
 }
 
+enum FccEvent {
+    FccTimeout,
+    FccPacket(Result<(usize, SocketAddr), std::io::Error>),
+    MulticastPacket(Result<(usize, SocketAddr), std::io::Error>),
+}
+
 fn filter_reordered_seq(seq: &mut u16, next: u16) -> bool {
     let valid = seq.wrapping_add(3000);
     if *seq == 0
@@ -41,6 +47,10 @@ fn filter_reordered_seq(seq: &mut u16, next: u16) -> bool {
     } else {
         false
     }
+}
+
+fn seq_at_or_after(next: u16, current: u16) -> bool {
+    current == 0 || (next.wrapping_sub(current) as i16) >= 0
 }
 
 fn resolve_interface_ipv4(if_name: Option<&str>) -> Result<Ipv4Addr> {
@@ -77,6 +87,13 @@ fn create_multicast_socket(multi_addr: SocketAddrV4) -> Result<UdpSocket> {
         socket.bind(&SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), multi_addr.port()).into())?;
     }
     Ok(UdpSocket::from_std(socket.into())?)
+}
+
+fn join_multicast_socket(multi_addr: SocketAddrV4, interface: Ipv4Addr) -> Result<UdpSocket> {
+    let socket = create_multicast_socket(multi_addr)?;
+    socket.set_multicast_loop_v4(true)?;
+    socket.join_multicast_v4(*multi_addr.ip(), interface)?;
+    Ok(socket)
 }
 
 fn create_fcc_socket(interface: Ipv4Addr, _if_name: Option<&str>) -> Result<UdpSocket> {
@@ -260,6 +277,7 @@ pub(crate) fn udp_source(
 
         let mut seq = 0u16;
         let mut use_multicast = true;
+        let mut active_multicast_socket: Option<UdpSocket> = None;
 
         if let Some(fcc) = fcc {
             info!(
@@ -278,6 +296,10 @@ pub(crate) fn udp_source(
                     let mut redirects = 0usize;
                     let mut state = FccState::Requested;
                     let mut verify_server_ip = false;
+                    let mut transition_multicast_socket: Option<UdpSocket> = None;
+                    let mut transition_complete = false;
+                    let mut mcast_buf = vec![0u8; 64 * 1024];
+                    let mut termination_sent = false;
 
                     if let Ok(local_addr) = socket.local_addr() {
                         debug!(
@@ -309,22 +331,83 @@ pub(crate) fn udp_source(
                                 wait.as_millis(),
                                 server
                             );
-                            let recv = timeout(wait, socket.recv_from(&mut buf)).await;
-                            let Ok(recv) = recv else {
-                                info!(
-                                    target: "iptv::fcc",
-                                    "fcc timeout state={:?} multicast={} server={}, fallback to multicast",
-                                    state,
-                                    multi_addr,
-                                    server
-                                );
-                                break;
+                            let event = if let Some(mcast_socket) = transition_multicast_socket.as_ref() {
+                                tokio::select! {
+                                    recv = timeout(wait, socket.recv_from(&mut buf)) => {
+                                        match recv {
+                                            Ok(recv) => FccEvent::FccPacket(recv),
+                                            Err(_) => FccEvent::FccTimeout,
+                                        }
+                                    }
+                                    recv = mcast_socket.recv_from(&mut mcast_buf) => FccEvent::MulticastPacket(recv),
+                                }
+                            } else {
+                                let recv = timeout(wait, socket.recv_from(&mut buf)).await;
+                                match recv {
+                                    Ok(recv) => FccEvent::FccPacket(recv),
+                                    Err(_) => FccEvent::FccTimeout,
+                                }
                             };
-                            let Ok((size, peer)) = recv else {
-                                warn!(target: "iptv::fcc", "fcc recv error, fallback to multicast");
-                                break;
+
+                            let (size, peer, packet, is_multicast_event) = match event {
+                                FccEvent::FccTimeout => {
+                                    info!(
+                                        target: "iptv::fcc",
+                                        "fcc timeout state={:?} multicast={} server={}, fallback to multicast",
+                                        state,
+                                        multi_addr,
+                                        server
+                                    );
+                                    break;
+                                }
+                                FccEvent::FccPacket(Ok((size, peer))) => (size, peer, &buf[..size], false),
+                                FccEvent::FccPacket(Err(_)) => {
+                                    warn!(target: "iptv::fcc", "fcc recv error, fallback to multicast");
+                                    break;
+                                }
+                                FccEvent::MulticastPacket(Ok((size, peer))) => (size, peer, &mcast_buf[..size], true),
+                                FccEvent::MulticastPacket(Err(err)) => {
+                                    warn!(target: "iptv::fcc", "multicast recv error during transition: {}", err);
+                                    continue;
+                                }
                             };
-                            let packet = &buf[..size];
+
+                            if is_multicast_event {
+                                let SocketAddr::V4(peer_v4) = peer else {
+                                    continue;
+                                };
+                                if let Ok(rtp) = RtpReader::new(packet) {
+                                    let next: u16 = rtp.sequence_number().into();
+                                    if seq_at_or_after(next, seq) {
+                                        if !termination_sent {
+                                            if let Err(err) = send_fcc_termination(&socket, multi_addr, server).await {
+                                                debug!(target: "iptv::fcc", "failed to send FCC termination to {}: {}", server, err);
+                                            } else {
+                                                termination_sent = true;
+                                            }
+                                        }
+                                        info!(
+                                            target: "iptv::fcc",
+                                            "switching from FCC unicast to multicast multicast={} seq={} peer={}",
+                                            multi_addr,
+                                            next,
+                                            peer_v4
+                                        );
+                                        if filter_reordered_seq(&mut seq, next) {
+                                            yield Ok(Bytes::copy_from_slice(rtp.payload()));
+                                        }
+                                        transition_complete = true;
+                                        break;
+                                    }
+                                    debug!(
+                                        target: "iptv::fcc",
+                                        "buffered multicast seq={} still behind current_unicast_seq={}",
+                                        next,
+                                        seq
+                                    );
+                                }
+                                continue;
+                            }
 
                             if is_rtcp_packet(packet) {
                                 let SocketAddr::V4(peer_v4) = peer else {
@@ -395,11 +478,37 @@ pub(crate) fn udp_source(
                                             meta.media_port,
                                             meta.server_ip
                                         );
-                                        info!(
-                                            target: "iptv::fcc",
-                                            "FCC sync notification received, switching to multicast without smooth handoff"
-                                        );
-                                        break;
+                                        if transition_multicast_socket.is_none() {
+                                            info!(
+                                                target: "iptv::fcc",
+                                                "FCC sync notification received, joining multicast for smooth switchover"
+                                            );
+                                            match join_multicast_socket(multi_addr, interface) {
+                                                Ok(mcast_socket) => {
+                                                    info!(
+                                                        target: "iptv::fcc",
+                                                        "joined multicast during FCC transition multicast={} interface={}",
+                                                        multi_addr,
+                                                        interface
+                                                    );
+                                                    transition_multicast_socket = Some(mcast_socket);
+                                                }
+                                                Err(err) => {
+                                                    warn!(
+                                                        target: "iptv::fcc",
+                                                        "failed to join multicast during FCC transition: {}, falling back later",
+                                                        err
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                        } else {
+                                            debug!(
+                                                target: "iptv::fcc",
+                                                "ignoring duplicate FCC sync notification after multicast transition is already armed"
+                                            );
+                                        }
+                                        continue;
                                     }
                                     Ok((TelecomResponse::AwaitUnicast { server: next_server, media_port }, meta)) => {
                                         debug!(
@@ -520,8 +629,12 @@ pub(crate) fn udp_source(
                                 peer
                             );
                         }
-                        if let Err(err) = send_fcc_termination(&socket, multi_addr, server).await {
-                            debug!(target: "iptv::fcc", "failed to send FCC termination to {}: {}", server, err);
+                        if transition_complete {
+                            active_multicast_socket = transition_multicast_socket.take();
+                        } else if !termination_sent {
+                            if let Err(err) = send_fcc_termination(&socket, multi_addr, server).await {
+                                debug!(target: "iptv::fcc", "failed to send FCC termination to {}: {}", server, err);
+                            }
                         }
                     }
                 }
@@ -531,25 +644,26 @@ pub(crate) fn udp_source(
             }
         }
 
-        let socket = match create_multicast_socket(multi_addr) {
-            Ok(socket) => socket,
-            Err(err) => {
-                error!("failed to create multicast socket for {}: {}", multi_addr, err);
-                return;
+        let socket = match active_multicast_socket.take() {
+            Some(socket) => socket,
+            None => match join_multicast_socket(multi_addr, interface) {
+                Ok(socket) => socket,
+                Err(err) => {
+                    error!("failed to join multicast {} via {}: {}", multi_addr, interface, err);
+                    return;
+                }
             }
         };
 
-        if let Err(err) = socket.set_multicast_loop_v4(true) {
-            error!("failed to enable multicast loop for {}: {}", multi_addr, err);
-            return;
-        }
-        if let Err(err) = socket.join_multicast_v4(*multi_addr.ip(), interface) {
-            error!("failed to join multicast {} via {}: {}", multi_addr, interface, err);
-            return;
-        }
-
         if use_multicast {
             info!("Udp proxy joined {}", multi_addr);
+        } else if active_multicast_socket.is_some() {
+            info!(
+                target: "iptv::fcc",
+                "continuing on multicast after FCC switchover multicast={} interface={}",
+                multi_addr,
+                interface
+            );
         } else {
             info!(
                 target: "iptv::fcc",

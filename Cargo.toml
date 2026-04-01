@@ -38,7 +38,7 @@ rtp-rs = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = "0.6"
-tokio = "1"
+tokio = { version = "1", features = ["macros"] }
 tokio-util = { version = "0.7.18", features = ["codec", "net"] }
 toml = "1.1"
 xml-rs = "1.0.0"
