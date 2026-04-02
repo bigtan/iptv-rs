@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
@@ -164,8 +165,9 @@ async fn send_fcc_termination(
     socket: &UdpSocket,
     multicast_addr: SocketAddrV4,
     server: SocketAddrV4,
+    seqn: u16,
 ) -> Result<()> {
-    let packet = build_telecom_termination(multicast_addr, 0);
+    let packet = build_telecom_termination(multicast_addr, seqn);
     debug!(
         target: "iptv::fcc",
         "telecom FCC termination bytes=[{}]",
@@ -300,6 +302,8 @@ pub(crate) fn udp_source(
                     let mut transition_complete = false;
                     let mut mcast_buf = vec![0u8; 64 * 1024];
                     let mut termination_sent = false;
+                    let mut target_switch_seq: Option<u16> = None;
+                    let mut pending_multicast: VecDeque<(u16, Bytes)> = VecDeque::new();
 
                     if let Ok(local_addr) = socket.local_addr() {
                         debug!(
@@ -378,33 +382,54 @@ pub(crate) fn udp_source(
                                 };
                                 if let Ok(rtp) = RtpReader::new(packet) {
                                     let next: u16 = rtp.sequence_number().into();
-                                    if seq_at_or_after(next, seq) {
+                                    if !termination_sent {
+                                        let term_seq = next.wrapping_add(2);
+                                        if let Err(err) =
+                                            send_fcc_termination(&socket, multi_addr, server, term_seq).await
+                                        {
+                                            debug!(
+                                                target: "iptv::fcc",
+                                                "failed to send FCC termination to {}: {}",
+                                                server,
+                                                err
+                                            );
+                                        } else {
+                                            termination_sent = true;
+                                            target_switch_seq = Some(term_seq);
+                                            info!(
+                                                target: "iptv::fcc",
+                                                "armed multicast switchover multicast={} first_mcast_seq={} target_switch_seq={} peer={}",
+                                                multi_addr,
+                                                next,
+                                                term_seq,
+                                                peer_v4
+                                            );
+                                        }
+                                    }
+                                    pending_multicast
+                                        .push_back((next, Bytes::copy_from_slice(rtp.payload())));
+                                    if let Some(target_switch_seq) = target_switch_seq
+                                        && seq_at_or_after(seq, target_switch_seq)
+                                    {
                                         if !termination_sent {
-                                            if let Err(err) = send_fcc_termination(&socket, multi_addr, server).await {
-                                                debug!(target: "iptv::fcc", "failed to send FCC termination to {}: {}", server, err);
-                                            } else {
-                                                termination_sent = true;
-                                            }
+                                            debug!(target: "iptv::fcc", "switch target reached without termination flag");
                                         }
                                         info!(
                                             target: "iptv::fcc",
-                                            "switching from FCC unicast to multicast multicast={} seq={} peer={}",
+                                            "switching from FCC unicast to multicast multicast={} current_seq={} target_switch_seq={} peer={}",
                                             multi_addr,
-                                            next,
+                                            seq,
+                                            target_switch_seq,
                                             peer_v4
                                         );
-                                        if filter_reordered_seq(&mut seq, next) {
-                                            yield Ok(Bytes::copy_from_slice(rtp.payload()));
+                                        while let Some((pending_seq, payload)) = pending_multicast.pop_front() {
+                                            if filter_reordered_seq(&mut seq, pending_seq) {
+                                                yield Ok(payload);
+                                            }
                                         }
                                         transition_complete = true;
                                         break;
                                     }
-                                    debug!(
-                                        target: "iptv::fcc",
-                                        "buffered multicast seq={} still behind current_unicast_seq={}",
-                                        next,
-                                        seq
-                                    );
                                 }
                                 continue;
                             }
@@ -619,6 +644,24 @@ pub(crate) fn udp_source(
                                 if filter_reordered_seq(&mut seq, next) {
                                     yield Ok(Bytes::copy_from_slice(rtp.payload()));
                                 }
+                                if let Some(target_switch_seq) = target_switch_seq
+                                    && seq_at_or_after(seq, target_switch_seq)
+                                {
+                                    info!(
+                                        target: "iptv::fcc",
+                                        "switching from FCC unicast to multicast after unicast advanced current_seq={} target_switch_seq={} multicast={}",
+                                        seq,
+                                        target_switch_seq,
+                                        multi_addr
+                                    );
+                                    while let Some((pending_seq, payload)) = pending_multicast.pop_front() {
+                                        if filter_reordered_seq(&mut seq, pending_seq) {
+                                            yield Ok(payload);
+                                        }
+                                    }
+                                    transition_complete = true;
+                                    break;
+                                }
                                 continue;
                             }
 
@@ -632,7 +675,7 @@ pub(crate) fn udp_source(
                         if transition_complete {
                             active_multicast_socket = transition_multicast_socket.take();
                         } else if !termination_sent {
-                            if let Err(err) = send_fcc_termination(&socket, multi_addr, server).await {
+                            if let Err(err) = send_fcc_termination(&socket, multi_addr, server, 0).await {
                                 debug!(target: "iptv::fcc", "failed to send FCC termination to {}: {}", server, err);
                             }
                         }
