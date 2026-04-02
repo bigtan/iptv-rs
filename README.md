@@ -48,6 +48,7 @@ Key sections:
 - `[app]`: login, bind address, proxy switches
 - `[auth]`: token protection
 - `[fcc]`: FCC enablement and timeout tuning
+  Includes startup buffering and delayed multicast switchover thresholds for high bitrate channels.
 - `[alias]`: alias rewrite rules
 - `[resolution]`: quality scoring rules
 - `[groups]`: channel grouping
@@ -67,6 +68,7 @@ Key sections:
 - `/manage/channels`
 - `/manage/channels/html`
 - `/udp/{addr}?fcc=ip:port`
+- `/rtp/{addr}?fcc=ip:port`
 - `/rtsp/{tail:.*}`
 
 ## Authentication

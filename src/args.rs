@@ -57,4 +57,8 @@ pub(crate) struct EffectiveArgs {
     pub(crate) fcc_signaling_timeout_ms: u64,
     pub(crate) fcc_unicast_idle_timeout_ms: u64,
     pub(crate) fcc_max_redirects: usize,
+    pub(crate) fcc_startup_buffer_ms: u64,
+    pub(crate) fcc_startup_buffer_packets: usize,
+    pub(crate) fcc_switch_extra_packets: usize,
+    pub(crate) fcc_switch_min_unicast_ms: u64,
 }

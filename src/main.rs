@@ -727,6 +727,10 @@ fn build_effective_args(args: &Args, config: &Config) -> Result<EffectiveArgs> {
         fcc_signaling_timeout_ms: config.fcc.signaling_timeout_ms,
         fcc_unicast_idle_timeout_ms: config.fcc.unicast_idle_timeout_ms,
         fcc_max_redirects: config.fcc.max_redirects,
+        fcc_startup_buffer_ms: config.fcc.startup_buffer_ms,
+        fcc_startup_buffer_packets: config.fcc.startup_buffer_packets,
+        fcc_switch_extra_packets: config.fcc.switch_extra_packets,
+        fcc_switch_min_unicast_ms: config.fcc.switch_min_unicast_ms,
     })
 }
 
@@ -1910,6 +1914,10 @@ async fn udp_like(
                     signaling_timeout_ms: state.args.fcc_signaling_timeout_ms,
                     unicast_idle_timeout_ms: state.args.fcc_unicast_idle_timeout_ms,
                     max_redirects: state.args.fcc_max_redirects,
+                    startup_buffer_ms: state.args.fcc_startup_buffer_ms,
+                    startup_buffer_packets: state.args.fcc_startup_buffer_packets,
+                    switch_extra_packets: state.args.fcc_switch_extra_packets,
+                    switch_min_unicast_ms: state.args.fcc_switch_min_unicast_ms,
                 })
             }
             Ok(server) => {
@@ -1996,7 +2004,7 @@ async fn main() -> std::io::Result<()> {
         }
     };
     debug!(
-        "Effective runtime config bind={} interface={:?} udp_proxy={} rtsp_proxy={} fcc_enabled={} fcc_signaling_timeout_ms={} fcc_unicast_idle_timeout_ms={} fcc_max_redirects={}",
+        "Effective runtime config bind={} interface={:?} udp_proxy={} rtsp_proxy={} fcc_enabled={} fcc_signaling_timeout_ms={} fcc_unicast_idle_timeout_ms={} fcc_max_redirects={} fcc_startup_buffer_ms={} fcc_startup_buffer_packets={} fcc_switch_extra_packets={} fcc_switch_min_unicast_ms={}",
         effective_args.bind,
         effective_args.interface,
         effective_args.udp_proxy,
@@ -2004,7 +2012,11 @@ async fn main() -> std::io::Result<()> {
         effective_args.fcc_enabled,
         effective_args.fcc_signaling_timeout_ms,
         effective_args.fcc_unicast_idle_timeout_ms,
-        effective_args.fcc_max_redirects
+        effective_args.fcc_max_redirects,
+        effective_args.fcc_startup_buffer_ms,
+        effective_args.fcc_startup_buffer_packets,
+        effective_args.fcc_switch_extra_packets,
+        effective_args.fcc_switch_min_unicast_ms
     );
 
     let state = Data::new(AppState {

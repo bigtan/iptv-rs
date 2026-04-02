@@ -13,6 +13,10 @@ pub(crate) struct FccOptions {
     pub(crate) signaling_timeout_ms: u64,
     pub(crate) unicast_idle_timeout_ms: u64,
     pub(crate) max_redirects: usize,
+    pub(crate) startup_buffer_ms: u64,
+    pub(crate) startup_buffer_packets: usize,
+    pub(crate) switch_extra_packets: usize,
+    pub(crate) switch_min_unicast_ms: u64,
 }
 
 #[derive(Clone, Debug)]

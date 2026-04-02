@@ -42,6 +42,10 @@ pub(crate) struct FccConfig {
     pub(crate) signaling_timeout_ms: u64,
     pub(crate) unicast_idle_timeout_ms: u64,
     pub(crate) max_redirects: usize,
+    pub(crate) startup_buffer_ms: u64,
+    pub(crate) startup_buffer_packets: usize,
+    pub(crate) switch_extra_packets: usize,
+    pub(crate) switch_min_unicast_ms: u64,
 }
 
 impl Default for FccConfig {
@@ -51,6 +55,10 @@ impl Default for FccConfig {
             signaling_timeout_ms: 80,
             unicast_idle_timeout_ms: 1000,
             max_redirects: 5,
+            startup_buffer_ms: 300,
+            startup_buffer_packets: 48,
+            switch_extra_packets: 64,
+            switch_min_unicast_ms: 500,
         }
     }
 }

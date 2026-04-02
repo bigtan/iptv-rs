@@ -19,6 +19,10 @@ enabled = true
 signaling_timeout_ms = 80
 unicast_idle_timeout_ms = 1000
 max_redirects = 5
+startup_buffer_ms = 300
+startup_buffer_packets = 48
+switch_extra_packets = 64
+switch_min_unicast_ms = 500
 
 [alias]
 mode = "first_match"
