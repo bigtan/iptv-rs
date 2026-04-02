@@ -316,6 +316,7 @@ pub(crate) fn udp_source(
                     let mut termination_sent = false;
                     let mut target_switch_seq: Option<u16> = None;
                     let mut pending_multicast: VecDeque<(u16, Bytes)> = VecDeque::new();
+                    let mut switch_armed_at: Option<tokio::time::Instant> = None;
                     let mut startup_unicast: VecDeque<(u16, Bytes)> = VecDeque::new();
                     let mut startup_started_at: Option<tokio::time::Instant> = None;
                     let mut startup_released = fcc.startup_buffer_ms == 0 && fcc.startup_buffer_packets == 0;
@@ -341,16 +342,13 @@ pub(crate) fn udp_source(
                                     Duration::from_millis(fcc.signaling_timeout_ms)
                                 }
                                 FccState::UnicastActive => {
-                                    Duration::from_millis(fcc.unicast_idle_timeout_ms)
+                                    if target_switch_seq.is_some() && !pending_multicast.is_empty() {
+                                        Duration::from_millis(100)
+                                    } else {
+                                        Duration::from_millis(fcc.unicast_idle_timeout_ms)
+                                    }
                                 }
                             };
-                            debug!(
-                                target: "iptv::fcc",
-                                "waiting FCC packet state={:?} timeout={}ms server={}",
-                                state,
-                                wait.as_millis(),
-                                server
-                            );
                             let event = if let Some(mcast_socket) = transition_multicast_socket.as_ref() {
                                 tokio::select! {
                                     recv = timeout(wait, socket.recv_from(&mut buf)) => {
@@ -371,6 +369,26 @@ pub(crate) fn udp_source(
 
                             let (size, peer, packet, is_multicast_event) = match event {
                                 FccEvent::FccTimeout => {
+                                    if target_switch_seq.is_some() && !pending_multicast.is_empty() {
+                                        let armed_ms = switch_armed_at
+                                            .map(|started| started.elapsed().as_millis() as u64)
+                                            .unwrap_or(0);
+                                        info!(
+                                            target: "iptv::fcc",
+                                            "forcing multicast switchover after armed wait timeout multicast={} current_seq={} buffered_packets={} armed_ms={}",
+                                            multi_addr,
+                                            seq,
+                                            pending_multicast.len(),
+                                            armed_ms
+                                        );
+                                        while let Some((pending_seq, payload)) = pending_multicast.pop_front() {
+                                            if filter_reordered_seq(&mut seq, pending_seq) {
+                                                yield Ok(payload);
+                                            }
+                                        }
+                                        transition_complete = true;
+                                        break;
+                                    }
                                     info!(
                                         target: "iptv::fcc",
                                         "fcc timeout state={:?} multicast={} server={}, fallback to multicast",
@@ -413,6 +431,7 @@ pub(crate) fn udp_source(
                                         } else {
                                             termination_sent = true;
                                             target_switch_seq = Some(term_seq);
+                                            switch_armed_at = Some(tokio::time::Instant::now());
                                             info!(
                                                 target: "iptv::fcc",
                                                 "armed multicast switchover multicast={} first_mcast_seq={} target_switch_seq={} peer={}",
@@ -425,6 +444,9 @@ pub(crate) fn udp_source(
                                     }
                                     pending_multicast
                                         .push_back((next, Bytes::copy_from_slice(rtp.payload())));
+                                    let armed_ms = switch_armed_at
+                                        .map(|started| started.elapsed().as_millis() as u64)
+                                        .unwrap_or(0);
                                     let unicast_elapsed_ms = unicast_started_at
                                         .map(|started| started.elapsed().as_millis() as u64)
                                         .unwrap_or(0);
@@ -445,6 +467,26 @@ pub(crate) fn udp_source(
                                             seq,
                                             target_switch_seq,
                                             peer_v4
+                                        );
+                                        while let Some((pending_seq, payload)) = pending_multicast.pop_front() {
+                                            if filter_reordered_seq(&mut seq, pending_seq) {
+                                                yield Ok(payload);
+                                            }
+                                        }
+                                        transition_complete = true;
+                                        break;
+                                    }
+                                    if target_switch_seq.is_some()
+                                        && !pending_multicast.is_empty()
+                                        && armed_ms >= 100
+                                    {
+                                        info!(
+                                            target: "iptv::fcc",
+                                            "forcing multicast switchover from multicast side after armed wait multicast={} current_seq={} buffered_packets={} armed_ms={}",
+                                            multi_addr,
+                                            seq,
+                                            pending_multicast.len(),
+                                            armed_ms
                                         );
                                         while let Some((pending_seq, payload)) = pending_multicast.pop_front() {
                                             if filter_reordered_seq(&mut seq, pending_seq) {
