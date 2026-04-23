@@ -1,9 +1,7 @@
 use crate::args::EffectiveArgs;
 use anyhow::{Result, anyhow};
-use des::{
-    TdesEde3,
-    cipher::{BlockEncryptMut, KeyInit, block_padding::Pkcs7},
-};
+use des::TdesEde3;
+use ecb::cipher::{BlockModeEncrypt, KeyInit, block_padding::Pkcs7};
 #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
 use local_ip_address::list_afinet_netifas;
 use log::{debug, info};
@@ -104,7 +102,7 @@ async fn fetch_channellist_raw(
         "{}${token}${user}${imei}${ip}${mac}$$CTC",
         rand::random_range(0..10000000),
     );
-    let auth = hex::encode_upper(enc.encrypt_padded_vec_mut::<Pkcs7>(data.as_bytes()));
+    let auth = hex::encode_upper(enc.encrypt_padded_vec::<Pkcs7>(data.as_bytes()));
 
     debug!("Got auth {auth}");
 

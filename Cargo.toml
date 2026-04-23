@@ -16,8 +16,8 @@ anyhow = "1.0.102"
 async-stream = "0.3"
 chrono = "0.4.44"
 clap = { version = "4.6", features = ["derive"] }
-des = "0.8"
-ecb = { version = "0.1", features = ["alloc", "block-padding"] }
+des = "0.9"
+ecb = { version = "0.2", features = ["alloc", "block-padding"] }
 env_logger = { version = "0.11", default-features = false, features = [
     "auto-color",
 ] }
