@@ -575,10 +575,10 @@ fn resolve_control_url(base: &Url, request_url: &Url, control: &str) -> Result<S
     }
     if control.starts_with("rtsp://") || control.starts_with("rtsps://") {
         let mut url = Url::parse(control)?;
-        if url.query().is_none() {
-            if let Some(query) = base.query().or_else(|| request_url.query()) {
-                url.set_query(Some(query));
-            }
+        if url.query().is_none()
+            && let Some(query) = base.query().or_else(|| request_url.query())
+        {
+            url.set_query(Some(query));
         }
         return Ok(url.to_string());
     }
@@ -596,10 +596,10 @@ fn resolve_control_url(base: &Url, request_url: &Url, control: &str) -> Result<S
         return Ok(root.to_string());
     }
     let mut joined = join_control_url(base, request_url, control)?;
-    if joined.query().is_none() {
-        if let Some(query) = base.query().or_else(|| request_url.query()) {
-            joined.set_query(Some(query));
-        }
+    if joined.query().is_none()
+        && let Some(query) = base.query().or_else(|| request_url.query())
+    {
+        joined.set_query(Some(query));
     }
     Ok(joined.to_string())
 }

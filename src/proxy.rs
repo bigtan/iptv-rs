@@ -777,11 +777,10 @@ pub(crate) fn udp_source(
                         }
                         if transition_complete {
                             active_multicast_socket = transition_multicast_socket.take();
-                        } else if !termination_sent {
-                            if let Err(err) = send_fcc_termination(&socket, multi_addr, server, 0).await {
+                        } else if !termination_sent
+                            && let Err(err) = send_fcc_termination(&socket, multi_addr, server, 0).await {
                                 debug!(target: "iptv::fcc", "failed to send FCC termination to {}: {}", server, err);
                             }
-                        }
                     }
                 }
                 Err(err) => {

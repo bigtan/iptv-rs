@@ -106,10 +106,10 @@ fn with_auth_cookie(
     endpoint: &str,
     mut response: HttpResponse,
 ) -> HttpResponse {
-    if let Some(cookie) = maybe_auth_cookie(req, config, endpoint) {
-        if let Ok(value) = header::HeaderValue::from_str(&cookie.to_string()) {
-            response.headers_mut().append(header::SET_COOKIE, value);
-        }
+    if let Some(cookie) = maybe_auth_cookie(req, config, endpoint)
+        && let Ok(value) = header::HeaderValue::from_str(&cookie.to_string())
+    {
+        response.headers_mut().append(header::SET_COOKIE, value);
     }
     response
 }
