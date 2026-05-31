@@ -226,7 +226,7 @@ pub(crate) async fn get_channels(
                             if args.udp_proxy {
                                 let mut proxied =
                                     igmp.replace("igmp://", &format!("{}://{}/udp/", scheme, host));
-                                if let Some(fcc) = fcc.as_ref() {
+                                if args.fcc_enabled && let Some(fcc) = fcc.as_ref() {
                                     proxied.push_str("?fcc=");
                                     proxied.push_str(fcc);
                                 }

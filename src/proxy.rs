@@ -24,6 +24,8 @@ use crate::fcc::{
 };
 use crate::rtsp_client::{KEEPALIVE_INTERVAL, RtspClient, RtspMessage};
 
+const UDP_SOCKET_RECV_BUFFER: usize = 4 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FccState {
     Requested,
@@ -87,6 +89,9 @@ fn create_multicast_socket(multi_addr: SocketAddrV4) -> Result<UdpSocket> {
         Some(socket2::Protocol::UDP),
     )?;
     socket.set_reuse_address(true)?;
+    if let Err(err) = socket.set_recv_buffer_size(UDP_SOCKET_RECV_BUFFER) {
+        warn!("failed to set multicast UDP receive buffer: {}", err);
+    }
     #[cfg(not(target_os = "windows"))]
     {
         socket.bind(&multi_addr.into())?;
@@ -112,6 +117,9 @@ fn create_fcc_socket(interface: Ipv4Addr, _if_name: Option<&str>) -> Result<UdpS
         Some(socket2::Protocol::UDP),
     )?;
     socket.set_reuse_address(true)?;
+    if let Err(err) = socket.set_recv_buffer_size(UDP_SOCKET_RECV_BUFFER) {
+        warn!(target: "iptv::fcc", "failed to set FCC UDP receive buffer: {}", err);
+    }
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "fuchsia"))]
     if let Some(if_name) = _if_name {
         match socket.bind_device(Some(if_name.as_bytes())) {
