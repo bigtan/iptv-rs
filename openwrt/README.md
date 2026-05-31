@@ -24,7 +24,18 @@ Package layout
 Expected feed usage
 -------------------
 
-Copy or symlink the two package directories into an OpenWrt package feed, then:
+From an OpenWrt source tree or SDK, copy the package directories into the local
+package tree:
+
+```sh
+cd openwrt
+
+mkdir -p package/iptv-rs
+cp -a ~/iptv-rs/openwrt/iptv-rs package/iptv-rs/
+cp -a ~/iptv-rs/openwrt/luci-app-iptv-rs package/iptv-rs/
+```
+
+Update feeds, select packages, then compile:
 
 ```sh
 ./scripts/feeds update -a
