@@ -1,0 +1,18 @@
+{
+	"luci-app-iptv-rs": {
+		"description": "Grant access to iptv-rs LuCI application",
+		"read": {
+			"ubus": {
+				"luci": [ "setInitAction" ],
+				"service": [ "list" ]
+			},
+			"uci": [ "iptv-rs" ]
+		},
+		"write": {
+			"ubus": {
+				"luci": [ "setInitAction" ]
+			},
+			"uci": [ "iptv-rs" ]
+		}
+	}
+}

@@ -1,0 +1,13 @@
+{
+	"admin/services/iptv-rs": {
+		"title": "IPTV RS",
+		"action": {
+			"type": "view",
+			"path": "iptv-rs/config"
+		},
+		"depends": {
+			"acl": [ "luci-app-iptv-rs" ],
+			"uci": { "iptv-rs": true }
+		}
+	}
+}

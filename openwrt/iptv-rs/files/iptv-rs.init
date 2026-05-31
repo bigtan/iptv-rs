@@ -1,0 +1,226 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=95
+STOP=10
+
+CONFIG_NAME="iptv-rs"
+TOML_CONFIG="/var/etc/iptv-rs.toml"
+
+toml_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+toml_string() {
+	printf '"%s"' "$(toml_escape "$1")"
+}
+
+toml_bool() {
+	[ "$1" = "1" ] && printf 'true' || printf 'false'
+}
+
+write_option_string() {
+	local section="$1"
+	local option="$2"
+	local key="${3:-$2}"
+	local value
+
+	config_get value "$section" "$option" ""
+	[ -n "$value" ] || return 0
+	printf '%s = ' "$key"
+	toml_string "$value"
+	printf '\n'
+}
+
+write_option_bool() {
+	local section="$1"
+	local option="$2"
+	local key="${3:-$2}"
+	local value
+
+	config_get_bool value "$section" "$option" 0
+	printf '%s = %s\n' "$key" "$(toml_bool "$value")"
+}
+
+write_option_number() {
+	local section="$1"
+	local option="$2"
+	local key="${3:-$2}"
+	local default="$4"
+	local value
+
+	config_get value "$section" "$option" "$default"
+	printf '%s = %s\n' "$key" "${value:-$default}"
+}
+
+_array_items=""
+append_array_item() {
+	local value="$1"
+	[ -n "$value" ] || return 0
+	[ -z "$_array_items" ] || _array_items="${_array_items}, "
+	_array_items="${_array_items}$(toml_string "$value")"
+}
+
+write_list_array() {
+	local section="$1"
+	local option="$2"
+	local key="${3:-$2}"
+
+	_array_items=""
+	config_list_foreach "$section" "$option" append_array_item
+	printf '%s = [%s]\n' "$key" "$_array_items"
+}
+
+write_alias_rule() {
+	local section="$1"
+	local kind pattern replace
+
+	config_get kind "$section" type "regex"
+	config_get pattern "$section" pattern ""
+	config_get replace "$section" replace ""
+	[ -n "$pattern" ] || return 0
+
+	printf '\n[[alias.rules]]\n'
+	printf 'type = '
+	toml_string "$kind"
+	printf '\npattern = '
+	toml_string "$pattern"
+	printf '\nreplace = '
+	toml_string "$replace"
+	printf '\n'
+}
+
+write_resolution_rule() {
+	local section="$1"
+	local pattern score label
+
+	config_get pattern "$section" pattern ""
+	config_get score "$section" score "0"
+	config_get label "$section" label ""
+	[ -n "$pattern" ] || return 0
+
+	printf '\n[[resolution.rules]]\n'
+	printf 'pattern = '
+	toml_string "$pattern"
+	printf '\nscore = %s\n' "$score"
+	if [ -n "$label" ]; then
+		printf 'label = '
+		toml_string "$label"
+		printf '\n'
+	fi
+}
+
+write_group_entry() {
+	local section="$1"
+	local group match_regex
+
+	config_get group "$section" group ""
+	config_get match_regex "$section" match_regex ""
+	[ -n "$group" ] || return 0
+
+	printf '\n[[groups.entries]]\n'
+	printf 'group = '
+	toml_string "$group"
+	printf '\n'
+	if [ -n "$match_regex" ]; then
+		printf 'match_regex = '
+		toml_string "$match_regex"
+		printf '\n'
+	else
+		write_list_array "$section" channels channels
+	fi
+}
+
+generate_toml() {
+	local alias_mode default_group
+
+	mkdir -p "$(dirname "$TOML_CONFIG")"
+	{
+		printf '[app]\n'
+		write_option_string main user
+		write_option_string main passwd
+		write_option_string main mac
+		write_option_string main imei
+		write_option_string main bind
+		write_option_string main address
+		write_option_string main interface
+		write_option_bool main udp_proxy
+		write_option_bool main rtsp_proxy
+
+		printf '\n[auth]\n'
+		write_option_string main auth_token token
+		write_list_array main auth_protect protect
+
+		printf '\n[manage]\n'
+		write_option_bool main manage_enabled enabled
+
+		printf '\n[fcc]\n'
+		write_option_bool main fcc_enabled enabled
+		write_option_number main fcc_signaling_timeout_ms signaling_timeout_ms 80
+		write_option_number main fcc_unicast_idle_timeout_ms unicast_idle_timeout_ms 1000
+		write_option_number main fcc_max_redirects max_redirects 5
+		write_option_number main fcc_startup_buffer_ms startup_buffer_ms 300
+		write_option_number main fcc_startup_buffer_packets startup_buffer_packets 48
+		write_option_number main fcc_switch_extra_packets switch_extra_packets 64
+		write_option_number main fcc_switch_min_unicast_ms switch_min_unicast_ms 500
+
+		config_get alias_mode main alias_mode "first_match"
+		printf '\n[alias]\nmode = '
+		toml_string "$alias_mode"
+		printf '\n'
+		config_foreach write_alias_rule alias_rule
+
+		printf '\n[resolution]\ndefault_score = 0\n'
+		config_foreach write_resolution_rule resolution_rule
+
+		config_get default_group main default_group "未分组"
+		printf '\n[groups]\ndefault_group = '
+		toml_string "$default_group"
+		printf '\n'
+		config_foreach write_group_entry group
+
+		printf '\n[sorting]\n'
+		write_list_array main same_alias same_alias
+		printf '\n[sorting.prefer_resolution]\n'
+		write_list_array main prefer_resolution order
+
+		printf '\n[xmltv]\n'
+		write_option_bool main xmltv_use_alias_name use_alias_name
+	} > "$TOML_CONFIG"
+}
+
+append_extra_playlist() {
+	[ -n "$1" ] && procd_append_param command --extra-playlist "$1"
+}
+
+append_extra_xmltv() {
+	[ -n "$1" ] && procd_append_param command --extra-xmltv "$1"
+}
+
+start_service() {
+	local enabled
+
+	config_load "$CONFIG_NAME"
+	config_get_bool enabled main enabled 0
+	[ "$enabled" = "1" ] || return 0
+
+	generate_toml
+
+	procd_open_instance
+	procd_set_param command /usr/bin/iptv-rs -c "$TOML_CONFIG"
+	config_list_foreach main extra_playlist append_extra_playlist
+	config_list_foreach main extra_xmltv append_extra_xmltv
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param respawn 3600 5 5
+	procd_close_instance
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "$CONFIG_NAME"
+}
