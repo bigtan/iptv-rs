@@ -7,10 +7,10 @@ PKG_RELEASE:=1
 PKG_SOURCE_URL:=https://github.com/bigtan/iptv-rs/releases/download/v$(PKG_VERSION)
 
 ifeq ($(ARCH),aarch64)
-  PKG_SOURCE:=$(PKG_NAME)-aarch64-unknown-linux-musl.zip
+  PKG_SOURCE:=iptv-rs-aarch64-unknown-linux-musl.zip
   PKG_HASH:=7220e6f33f866be33be2c8517f197ce7135659f5a64a8a892b2b3f02a3433ebd
 else ifeq ($(ARCH),x86_64)
-  PKG_SOURCE:=$(PKG_NAME)-x86_64-unknown-linux-musl.zip
+  PKG_SOURCE:=iptv-rs-x86_64-unknown-linux-musl.zip
   PKG_HASH:=1ffd69bc172a597e694fc84966b13e311771b5726b1b502d9361e6155f7175ab
 else
   PKG_SOURCE:=unsupported-$(ARCH).zip
