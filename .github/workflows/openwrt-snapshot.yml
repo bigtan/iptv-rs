@@ -102,22 +102,23 @@ jobs:
       - name: Build firmware and packages
         working-directory: ${{ env.OPENWRT_DIR }}
         run: |
-          make -j"$(nproc)" V=s
+          make -j"$(nproc)" || make -j1 V=s
 
       - name: Collect artifacts
         run: |
           mkdir -p "$GITHUB_WORKSPACE/openwrt-artifacts"
           rsync -a "$OPENWRT_DIR/bin/targets/" "$GITHUB_WORKSPACE/openwrt-artifacts/targets/"
           rsync -a "$OPENWRT_DIR/bin/packages/" "$GITHUB_WORKSPACE/openwrt-artifacts/packages/"
-          find "$GITHUB_WORKSPACE/openwrt-artifacts" -type f \
-            \( -name '*.bin' -o -name '*.img' -o -name '*.itb' -o -name '*.ubi' -o -name '*.apk' -o -name '*.buildinfo' -o -name '*.manifest' -o -name '*.json' -o -name 'sha256sums' \) \
-            -print > "$GITHUB_WORKSPACE/openwrt-artifacts/files.txt"
+          tar -C "$GITHUB_WORKSPACE/openwrt-artifacts" -czf "$GITHUB_WORKSPACE/openwrt-targets.tar.gz" targets
+          tar -C "$GITHUB_WORKSPACE/openwrt-artifacts" -czf "$GITHUB_WORKSPACE/openwrt-packages.tar.gz" packages
 
       - name: Upload OpenWrt artifacts
         uses: actions/upload-artifact@v7
         with:
           name: openwrt-snapshot-${{ github.run_number }}
-          path: openwrt-artifacts
+          path: |
+            openwrt-targets.tar.gz
+            openwrt-packages.tar.gz
           retention-days: 14
 
       - name: Prepare release tag
@@ -132,11 +133,5 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           name: OpenWrt Snapshot ${{ env.RELEASE_TAG }}
           files: |
-            openwrt-artifacts/targets/**/*.bin
-            openwrt-artifacts/targets/**/*.img
-            openwrt-artifacts/targets/**/*.itb
-            openwrt-artifacts/targets/**/*.ubi
-            openwrt-artifacts/targets/**/*.buildinfo
-            openwrt-artifacts/targets/**/*.manifest
-            openwrt-artifacts/targets/**/sha256sums
-            openwrt-artifacts/packages/**/*.apk
+            openwrt-targets.tar.gz
+            openwrt-packages.tar.gz
