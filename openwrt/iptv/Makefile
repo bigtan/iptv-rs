@@ -1,16 +1,16 @@
 include $(TOPDIR)/rules.mk
 
-PKG_NAME:=iptv-rs
+PKG_NAME:=iptv
 PKG_VERSION:=0.3.2
 PKG_RELEASE:=1
 
 PKG_SOURCE_URL:=https://github.com/bigtan/iptv-rs/releases/download/v$(PKG_VERSION)
 
 ifeq ($(ARCH),aarch64)
-  PKG_SOURCE:=$(PKG_NAME)-aarch64-unknown-linux-musl.zip
+  PKG_SOURCE:=iptv-rs-aarch64-unknown-linux-musl.zip
   PKG_HASH:=157ef9aa0d0f18f8977759194c80da1e272350dde14f6ec0dda1116a0687f2bf
 else ifeq ($(ARCH),x86_64)
-  PKG_SOURCE:=$(PKG_NAME)-x86_64-unknown-linux-musl.zip
+  PKG_SOURCE:=iptv-rs-x86_64-unknown-linux-musl.zip
   PKG_HASH:=6eae63281a9e818c98ec38d3ac8d6a2c17887e2c93449c91d4a893c7b5d81e17
 else
   PKG_SOURCE:=unsupported-$(ARCH).zip
@@ -25,7 +25,7 @@ PKG_MAINTAINER:=iptv-rs maintainers
 
 include $(INCLUDE_DIR)/package.mk
 
-define Package/iptv-rs
+define Package/iptv
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Rust IPTV proxy with RTSP replay and multicast proxy support
@@ -33,7 +33,7 @@ define Package/iptv-rs
   DEPENDS:=+ca-bundle
 endef
 
-define Package/iptv-rs/description
+define Package/iptv/description
   iptv-rs is an IPTV proxy with playlist/XMLTV aggregation, UDP multicast
   proxying, Telecom FCC bootstrap support, RTSP replay, and management
   endpoints.
@@ -48,17 +48,17 @@ define Build/Prepare
 endef
 endif
 
-define Package/iptv-rs/conffiles
-/etc/config/iptv-rs
+define Package/iptv/conffiles
+/etc/config/iptv
 endef
 
-define Package/iptv-rs/install
+define Package/iptv/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/iptv-rs $(1)/usr/bin/iptv-rs
 	$(INSTALL_DIR) $(1)/etc/config
-	$(INSTALL_CONF) ./files/iptv-rs.config $(1)/etc/config/iptv-rs
+	$(INSTALL_CONF) ./files/iptv.config $(1)/etc/config/iptv
 	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) ./files/iptv-rs.init $(1)/etc/init.d/iptv-rs
+	$(INSTALL_BIN) ./files/iptv.init $(1)/etc/init.d/iptv
 endef
 
-$(eval $(call BuildPackage,iptv-rs))
+$(eval $(call BuildPackage,iptv))

@@ -20,8 +20,8 @@ var callInitAction = rpc.declare({
 });
 
 function serviceStatus() {
-	return callServiceList('iptv-rs').then(function(res) {
-		var service = res['iptv-rs'];
+	return callServiceList('iptv').then(function(res) {
+		var service = res['iptv'];
 		var instances = service && service.instances ? service.instances : {};
 
 		for (var name in instances) {
@@ -36,7 +36,7 @@ function serviceStatus() {
 return L.view.extend({
 	load: function() {
 		return Promise.all([
-			uci.load('iptv-rs'),
+			uci.load('iptv'),
 			serviceStatus()
 		]);
 	},
@@ -44,7 +44,7 @@ return L.view.extend({
 	render: function(data) {
 		var m, s, o;
 
-		m = new form.Map('iptv-rs', _('IPTV RS'));
+		m = new form.Map('iptv', _('IPTV'));
 
 		s = m.section(form.NamedSection, 'main', 'service', _('Service'));
 		s.anonymous = true;
@@ -60,9 +60,9 @@ return L.view.extend({
 		o.inputstyle = 'apply';
 		o.onclick = function() {
 			return m.save().then(function() {
-				return callInitAction('iptv-rs', 'restart');
+				return callInitAction('iptv', 'restart');
 			}).then(function() {
-				ui.addNotification(null, E('p', _('iptv-rs restarted.')));
+				ui.addNotification(null, E('p', _('IPTV restarted.')));
 			});
 		};
 

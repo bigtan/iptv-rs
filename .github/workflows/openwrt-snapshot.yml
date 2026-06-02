@@ -1,0 +1,142 @@
+name: OpenWrt Snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_ref:
+        description: OpenWrt branch or tag, e.g. master, openwrt-25.12, v25.12.4
+        required: true
+        default: master
+      config_file:
+        description: OpenWrt .config path in this repository
+        required: true
+        default: openwrt/configs/mediatek-filogic-snapshot.config
+      lan_ip:
+        description: Default LAN IP address
+        required: true
+        default: 192.168.31.1
+      publish_release:
+        description: Publish firmware files to a GitHub release
+        required: true
+        type: boolean
+        default: false
+  schedule:
+    - cron: "30 18 * * 0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build OpenWrt snapshot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      OPENWRT_REF: ${{ github.event.inputs.openwrt_ref || 'master' }}
+      CONFIG_FILE: ${{ github.event.inputs.config_file || 'openwrt/configs/mediatek-filogic-snapshot.config' }}
+      LAN_IP: ${{ github.event.inputs.lan_ip || '192.168.31.1' }}
+      OPENWRT_DIR: ${{ github.workspace }}/openwrt-src
+
+    steps:
+      - name: Checkout iptv-rs
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc binutils-gold bison build-essential ccache clang curl ecj \
+            fastjar file flex g++ gawk gcc-multilib gettext git help2man \
+            libbsd-dev libelf-dev liblzma-dev libncurses-dev libssl-dev \
+            meson mold mtd-utils ninja-build pbzip2 pigz pkg-config \
+            python3-dev python3-setuptools rsync subversion swig texinfo \
+            time u-boot-tools unzip wget xsltproc xxd zlib1g-dev zstd
+
+      - name: Clone latest OpenWrt snapshot
+        run: |
+          git clone --depth 1 --branch "$OPENWRT_REF" https://github.com/openwrt/openwrt.git "$OPENWRT_DIR"
+
+      - name: Update and install OpenWrt feeds
+        working-directory: ${{ env.OPENWRT_DIR }}
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Import IPTV OpenWrt packages
+        run: |
+          mkdir -p "$OPENWRT_DIR/package/iptv"
+          cp -a "$GITHUB_WORKSPACE/openwrt/iptv" "$OPENWRT_DIR/package/iptv/"
+          cp -a "$GITHUB_WORKSPACE/openwrt/luci-app-iptv" "$OPENWRT_DIR/package/iptv/"
+
+      - name: Apply OpenWrt config
+        working-directory: ${{ env.OPENWRT_DIR }}
+        run: |
+          test -f "$GITHUB_WORKSPACE/$CONFIG_FILE"
+          cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+          cat >> .config <<'EOF'
+          CONFIG_PACKAGE_iptv=y
+          CONFIG_PACKAGE_luci-app-iptv=y
+          EOF
+          make defconfig
+
+      - name: Add first-boot LAN IP override
+        run: |
+          mkdir -p "$OPENWRT_DIR/files/etc/uci-defaults"
+          cat > "$OPENWRT_DIR/files/etc/uci-defaults/99-set-lan-ip" <<EOF
+          #!/bin/sh
+
+          uci set network.lan.ipaddr='$LAN_IP'
+          uci set network.lan.netmask='255.255.255.0'
+          uci commit network
+
+          exit 0
+          EOF
+          chmod +x "$OPENWRT_DIR/files/etc/uci-defaults/99-set-lan-ip"
+
+      - name: Download sources
+        working-directory: ${{ env.OPENWRT_DIR }}
+        run: |
+          make download -j"$(nproc)" || make download -j1 V=s
+
+      - name: Build firmware and packages
+        working-directory: ${{ env.OPENWRT_DIR }}
+        run: |
+          make -j"$(nproc)" V=s
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/openwrt-artifacts"
+          rsync -a "$OPENWRT_DIR/bin/targets/" "$GITHUB_WORKSPACE/openwrt-artifacts/targets/"
+          rsync -a "$OPENWRT_DIR/bin/packages/" "$GITHUB_WORKSPACE/openwrt-artifacts/packages/"
+          find "$GITHUB_WORKSPACE/openwrt-artifacts" -type f \
+            \( -name '*.bin' -o -name '*.img' -o -name '*.itb' -o -name '*.ubi' -o -name '*.apk' -o -name '*.buildinfo' -o -name '*.manifest' -o -name '*.json' -o -name 'sha256sums' \) \
+            -print > "$GITHUB_WORKSPACE/openwrt-artifacts/files.txt"
+
+      - name: Upload OpenWrt artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: openwrt-snapshot-${{ github.run_number }}
+          path: openwrt-artifacts
+          retention-days: 14
+
+      - name: Prepare release tag
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true' }}
+        run: |
+          echo "RELEASE_TAG=openwrt-snapshot-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub release
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true' }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: OpenWrt Snapshot ${{ env.RELEASE_TAG }}
+          files: |
+            openwrt-artifacts/targets/**/*.bin
+            openwrt-artifacts/targets/**/*.img
+            openwrt-artifacts/targets/**/*.itb
+            openwrt-artifacts/targets/**/*.ubi
+            openwrt-artifacts/targets/**/*.buildinfo
+            openwrt-artifacts/targets/**/*.manifest
+            openwrt-artifacts/targets/**/sha256sums
+            openwrt-artifacts/packages/**/*.apk

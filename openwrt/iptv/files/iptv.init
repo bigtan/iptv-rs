@@ -4,8 +4,8 @@ USE_PROCD=1
 START=95
 STOP=10
 
-CONFIG_NAME="iptv-rs"
-TOML_CONFIG="/var/etc/iptv-rs.toml"
+CONFIG_NAME="iptv"
+TOML_CONFIG="/var/etc/iptv.toml"
 
 tune_kernel_buffers() {
 	sysctl -w net.core.rmem_max=4194304 >/dev/null 2>&1 || true
