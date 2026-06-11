@@ -25,6 +25,9 @@ use crate::fcc::{
 use crate::rtsp_client::{KEEPALIVE_INTERVAL, RtspClient, RtspMessage};
 
 const UDP_SOCKET_RECV_BUFFER: usize = 4 * 1024 * 1024;
+const FCC_SIGNALING_TIMEOUT: Duration = Duration::from_millis(80);
+const FCC_UNICAST_IDLE_TIMEOUT: Duration = Duration::from_millis(1000);
+const FCC_ARMED_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FccState {
@@ -58,10 +61,6 @@ fn seq_at_or_after(next: u16, current: u16) -> bool {
 
 fn gate_satisfied_u64(elapsed: u64, threshold: u64) -> bool {
     threshold == 0 || elapsed >= threshold
-}
-
-fn gate_satisfied_usize(count: usize, threshold: usize) -> bool {
-    threshold == 0 || count >= threshold
 }
 
 fn resolve_interface_ipv4(if_name: Option<&str>) -> Result<Ipv4Addr> {
@@ -300,14 +299,10 @@ pub(crate) fn udp_source(
         if let Some(fcc) = fcc {
             info!(
                 target: "iptv::fcc",
-                "starting telecom FCC bootstrap multicast={} server={} signaling_timeout={}ms unicast_idle_timeout={}ms max_redirects={} startup_buffer_ms={} startup_buffer_packets={} switch_extra_packets={} switch_min_unicast_ms={}",
+                "starting telecom FCC bootstrap multicast={} server={} max_redirects={} switch_extra_packets={} switch_min_unicast_ms={}",
                 multi_addr,
                 fcc.server,
-                fcc.signaling_timeout_ms,
-                fcc.unicast_idle_timeout_ms,
                 fcc.max_redirects,
-                fcc.startup_buffer_ms,
-                fcc.startup_buffer_packets,
                 fcc.switch_extra_packets,
                 fcc.switch_min_unicast_ms
             );
@@ -325,9 +320,6 @@ pub(crate) fn udp_source(
                     let mut target_switch_seq: Option<u16> = None;
                     let mut pending_multicast: VecDeque<(u16, Bytes)> = VecDeque::new();
                     let mut switch_armed_at: Option<tokio::time::Instant> = None;
-                    let mut startup_unicast: VecDeque<(u16, Bytes)> = VecDeque::new();
-                    let mut startup_started_at: Option<tokio::time::Instant> = None;
-                    let mut startup_released = fcc.startup_buffer_ms == 0 && fcc.startup_buffer_packets == 0;
                     let mut unicast_started_at: Option<tokio::time::Instant> = None;
 
                     if let Ok(local_addr) = socket.local_addr() {
@@ -347,13 +339,13 @@ pub(crate) fn udp_source(
                         loop {
                             let wait = match state {
                                 FccState::Requested | FccState::UnicastPending => {
-                                    Duration::from_millis(fcc.signaling_timeout_ms)
+                                    FCC_SIGNALING_TIMEOUT
                                 }
                                 FccState::UnicastActive => {
                                     if target_switch_seq.is_some() && !pending_multicast.is_empty() {
-                                        Duration::from_millis(100)
+                                        FCC_ARMED_POLL_INTERVAL
                                     } else {
-                                        Duration::from_millis(fcc.unicast_idle_timeout_ms)
+                                        FCC_UNICAST_IDLE_TIMEOUT
                                     }
                                 }
                             };
@@ -383,18 +375,13 @@ pub(crate) fn udp_source(
                                             .unwrap_or(0);
                                         info!(
                                             target: "iptv::fcc",
-                                            "forcing multicast switchover after armed wait timeout multicast={} current_seq={} buffered_packets={} armed_ms={}",
+                                            "FCC unicast idle before RTP switch target, falling back to live multicast multicast={} current_seq={} buffered_packets={} armed_ms={}",
                                             multi_addr,
                                             seq,
                                             pending_multicast.len(),
                                             armed_ms
                                         );
-                                        while let Some((pending_seq, payload)) = pending_multicast.pop_front() {
-                                            if filter_reordered_seq(&mut seq, pending_seq) {
-                                                yield Ok(payload);
-                                            }
-                                        }
-                                        transition_complete = true;
+                                        active_multicast_socket = transition_multicast_socket.take();
                                         break;
                                     }
                                     info!(
@@ -452,55 +439,30 @@ pub(crate) fn udp_source(
                                     }
                                     pending_multicast
                                         .push_back((next, Bytes::copy_from_slice(rtp.payload())));
-                                    let armed_ms = switch_armed_at
+                                let armed_ms = switch_armed_at
                                         .map(|started| started.elapsed().as_millis() as u64)
                                         .unwrap_or(0);
                                     let unicast_elapsed_ms = unicast_started_at
                                         .map(|started| started.elapsed().as_millis() as u64)
                                         .unwrap_or(0);
-                                    if let Some(target_switch_seq) = target_switch_seq
-                                        && seq_at_or_after(seq, target_switch_seq)
+                                    let target_reached = target_switch_seq
+                                            .is_some_and(|target| seq_at_or_after(seq, target))
                                         && gate_satisfied_u64(
                                             unicast_elapsed_ms,
                                             fcc.switch_min_unicast_ms,
-                                        )
-                                    {
-                                        if !termination_sent {
-                                            debug!(target: "iptv::fcc", "switch target reached without termination flag");
-                                        }
+                                        );
+                                    if target_reached && !pending_multicast.is_empty() {
                                         info!(
                                             target: "iptv::fcc",
-                                            "switching from FCC unicast to multicast multicast={} current_seq={} target_switch_seq={} peer={}",
+                                            "switching FCC unicast -> multicast by RTP sequence multicast={} current_seq={} target_switch_seq={:?} buffered_packets={} armed_ms={} unicast_ms={} peer={}",
                                             multi_addr,
                                             seq,
                                             target_switch_seq,
+                                            pending_multicast.len(),
+                                            armed_ms,
+                                            unicast_elapsed_ms,
                                             peer_v4
                                         );
-                                        while let Some((pending_seq, payload)) = pending_multicast.pop_front() {
-                                            if filter_reordered_seq(&mut seq, pending_seq) {
-                                                yield Ok(payload);
-                                            }
-                                        }
-                                        transition_complete = true;
-                                        break;
-                                    }
-                                    if target_switch_seq.is_some()
-                                        && !pending_multicast.is_empty()
-                                        && armed_ms >= 100
-                                    {
-                                        info!(
-                                            target: "iptv::fcc",
-                                            "forcing multicast switchover from multicast side after armed wait multicast={} current_seq={} buffered_packets={} armed_ms={}",
-                                            multi_addr,
-                                            seq,
-                                            pending_multicast.len(),
-                                            armed_ms
-                                        );
-                                        while let Some((pending_seq, payload)) = pending_multicast.pop_front() {
-                                            if filter_reordered_seq(&mut seq, pending_seq) {
-                                                yield Ok(payload);
-                                            }
-                                        }
                                         transition_complete = true;
                                         break;
                                     }
@@ -714,39 +676,11 @@ pub(crate) fn udp_source(
                                         next
                                     );
                                     let now = tokio::time::Instant::now();
-                                    startup_started_at = Some(now);
                                     unicast_started_at = Some(now);
                                 }
                                 state = FccState::UnicastActive;
                                 let payload = Bytes::copy_from_slice(rtp.payload());
-                                if !startup_released {
-                                    startup_unicast.push_back((next, payload));
-                                    let startup_elapsed_ms = startup_started_at
-                                        .map(|started| started.elapsed().as_millis() as u64)
-                                        .unwrap_or(0);
-                                    if gate_satisfied_u64(startup_elapsed_ms, fcc.startup_buffer_ms)
-                                        && gate_satisfied_usize(
-                                            startup_unicast.len(),
-                                            fcc.startup_buffer_packets,
-                                        )
-                                    {
-                                        startup_released = true;
-                                        info!(
-                                            target: "iptv::fcc",
-                                            "releasing buffered FCC startup burst multicast={} buffered_packets={} buffered_ms={}",
-                                            multi_addr,
-                                            startup_unicast.len(),
-                                            startup_elapsed_ms
-                                        );
-                                        while let Some((buffered_seq, buffered_payload)) =
-                                            startup_unicast.pop_front()
-                                        {
-                                            if filter_reordered_seq(&mut seq, buffered_seq) {
-                                                yield Ok(buffered_payload);
-                                            }
-                                        }
-                                    }
-                                } else if filter_reordered_seq(&mut seq, next) {
+                                if filter_reordered_seq(&mut seq, next) {
                                     yield Ok(payload);
                                 }
                                 if let Some(target_switch_seq) = target_switch_seq
@@ -757,6 +691,7 @@ pub(crate) fn udp_source(
                                             .unwrap_or(0),
                                         fcc.switch_min_unicast_ms,
                                     )
+                                    && !pending_multicast.is_empty()
                                 {
                                     info!(
                                         target: "iptv::fcc",
@@ -765,11 +700,6 @@ pub(crate) fn udp_source(
                                         target_switch_seq,
                                         multi_addr
                                     );
-                                    while let Some((pending_seq, payload)) = pending_multicast.pop_front() {
-                                        if filter_reordered_seq(&mut seq, pending_seq) {
-                                            yield Ok(payload);
-                                        }
-                                    }
                                     transition_complete = true;
                                     break;
                                 }
@@ -784,6 +714,11 @@ pub(crate) fn udp_source(
                             );
                         }
                         if transition_complete {
+                            while let Some((pending_seq, payload)) = pending_multicast.pop_front() {
+                                if filter_reordered_seq(&mut seq, pending_seq) {
+                                    yield Ok(payload);
+                                }
+                            }
                             active_multicast_socket = transition_multicast_socket.take();
                         } else if !termination_sent
                             && let Err(err) = send_fcc_termination(&socket, multi_addr, server, 0).await {
@@ -797,6 +732,7 @@ pub(crate) fn udp_source(
             }
         }
 
+        let switched_to_multicast = active_multicast_socket.is_some();
         let socket = match active_multicast_socket.take() {
             Some(socket) => socket,
             None => match join_multicast_socket(multi_addr, interface) {
@@ -810,7 +746,7 @@ pub(crate) fn udp_source(
 
         if use_multicast {
             info!("Udp proxy joined {}", multi_addr);
-        } else if active_multicast_socket.is_some() {
+        } else if switched_to_multicast {
             info!(
                 target: "iptv::fcc",
                 "continuing on multicast after FCC switchover multicast={} interface={}",

@@ -384,6 +384,9 @@ impl RtspClient {
             .get("content-length")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(0);
+        if content_len > MAX_RTSP_BODY {
+            bail!("RTSP response body too large: {content_len} bytes");
+        }
         let total_len = header_end + 4 + content_len;
         self.ensure_buffered(total_len).await?;
         let body_start = self.read_pos + header_end + 4;
@@ -753,6 +756,11 @@ fn encode_base64(data: &[u8]) -> String {
 }
 
 pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Upper bound on an RTSP response body (e.g. SDP). Guards against a malformed
+/// or hostile server advertising a huge Content-Length and forcing the read
+/// buffer to grow without limit.
+const MAX_RTSP_BODY: usize = 4 * 1024 * 1024;
 
 impl KeepaliveMethod {
     fn as_str(self) -> &'static str {

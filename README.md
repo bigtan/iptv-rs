@@ -48,7 +48,7 @@ Key sections:
 - `[app]`: login, bind address, proxy switches
 - `[auth]`: token protection
 - `[fcc]`: FCC enablement and timeout tuning
-  Includes startup buffering and delayed multicast switchover thresholds for high bitrate channels.
+  Uses RTP sequence numbers for multicast switchover, with a minimum unicast play time before switching.
 - `[alias]`: alias rewrite rules
 - `[resolution]`: quality scoring rules
 - `[groups]`: channel grouping

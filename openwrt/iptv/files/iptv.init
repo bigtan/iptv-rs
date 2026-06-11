@@ -162,11 +162,7 @@ generate_toml() {
 
 		printf '\n[fcc]\n'
 		write_option_bool main fcc_enabled enabled
-		write_option_number main fcc_signaling_timeout_ms signaling_timeout_ms 80
-		write_option_number main fcc_unicast_idle_timeout_ms unicast_idle_timeout_ms 1000
 		write_option_number main fcc_max_redirects max_redirects 5
-		write_option_number main fcc_startup_buffer_ms startup_buffer_ms 300
-		write_option_number main fcc_startup_buffer_packets startup_buffer_packets 48
 		write_option_number main fcc_switch_extra_packets switch_extra_packets 64
 		write_option_number main fcc_switch_min_unicast_ms switch_min_unicast_ms 500
 

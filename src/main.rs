@@ -481,7 +481,11 @@ async fn xmltv(state: Data<AppState>, req: HttpRequest) -> impl Responder {
     }
     let scheme = req.connection_info().scheme().to_owned();
     let host = req.connection_info().host().to_owned();
-    let cache_key = format!("{}|{}", scheme, host);
+    let output_args = match output_effective_args(&state) {
+        Ok(args) => args,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
+    };
+    let cache_key = format!("{}|{}|{}", scheme, host, output_args.fcc_enabled);
     if let Some(xml) = get_cached_text(&state.xmltv_cache, &cache_key) {
         return HttpResponse::Ok().content_type("text/xml").body(xml);
     }
@@ -508,7 +512,7 @@ async fn xmltv(state: Data<AppState>, req: HttpRequest) -> impl Responder {
     } else {
         Vec::new()
     };
-    let xml = get_channels(&state.args, true, &scheme, &host)
+    let xml = get_channels(&output_args, true, &scheme, &host)
         .await
         .and_then(|mut ch| {
             if use_alias_name {
@@ -724,14 +728,23 @@ fn build_effective_args(args: &Args, config: &Config) -> Result<EffectiveArgs> {
         udp_proxy: args.udp_proxy || app.udp_proxy,
         rtsp_proxy: args.rtsp_proxy || app.rtsp_proxy,
         fcc_enabled: config.fcc.enabled,
-        fcc_signaling_timeout_ms: config.fcc.signaling_timeout_ms,
-        fcc_unicast_idle_timeout_ms: config.fcc.unicast_idle_timeout_ms,
         fcc_max_redirects: config.fcc.max_redirects,
-        fcc_startup_buffer_ms: config.fcc.startup_buffer_ms,
-        fcc_startup_buffer_packets: config.fcc.startup_buffer_packets,
         fcc_switch_extra_packets: config.fcc.switch_extra_packets,
         fcc_switch_min_unicast_ms: config.fcc.switch_min_unicast_ms,
     })
+}
+
+fn output_effective_args(state: &AppState) -> Result<EffectiveArgs> {
+    let runtime = state
+        .runtime
+        .read()
+        .map_err(|_| anyhow!("Config lock poisoned"))?;
+    let mut args = state.args.clone();
+    args.fcc_enabled = runtime.config.fcc.enabled;
+    args.fcc_max_redirects = runtime.config.fcc.max_redirects;
+    args.fcc_switch_extra_packets = runtime.config.fcc.switch_extra_packets;
+    args.fcc_switch_min_unicast_ms = runtime.config.fcc.switch_min_unicast_ms;
+    Ok(args)
 }
 
 fn build_local_entries(
@@ -811,13 +824,20 @@ async fn playlist_handler(state: Data<AppState>, req: HttpRequest) -> impl Respo
     } else {
         "${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"
     };
-    let cache_key = format!("{}|{}|{}", scheme, host, is_kodi);
+    let output_args = match output_effective_args(&state) {
+        Ok(args) => args,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
+    };
+    let cache_key = format!(
+        "{}|{}|{}|{}",
+        scheme, host, is_kodi, output_args.fcc_enabled
+    );
     if let Some(playlist) = get_cached_text(&state.playlist_cache, &cache_key) {
         return HttpResponse::Ok()
             .content_type("application/vnd.apple.mpegurl")
             .body(playlist);
     }
-    match get_channels(&state.args, false, &scheme, &host).await {
+    match get_channels(&output_args, false, &scheme, &host).await {
         Err(e) => {
             if let Some(old_playlist) = OLD_PLAYLIST.try_lock().ok().and_then(|f| f.to_owned()) {
                 HttpResponse::Ok()
@@ -829,7 +849,7 @@ async fn playlist_handler(state: Data<AppState>, req: HttpRequest) -> impl Respo
         }
         Ok(ch) => {
             let mut entries =
-                build_local_entries(ch, &state.args, &scheme, &host, playseek, 0, None);
+                build_local_entries(ch, &output_args, &scheme, &host, playseek, 0, None);
             if !state.args.extra_playlist.is_empty() {
                 let mut set = JoinSet::new();
                 for (i, u) in state.args.extra_playlist.iter().enumerate() {
@@ -1262,16 +1282,21 @@ async fn manage_channels(
     } else {
         "${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"
     };
-    let channels = match get_channels(&state.args, false, &scheme, &host).await {
+    let output_args = match output_effective_args(&state) {
+        Ok(args) => args,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
+    };
+    let channels = match get_channels(&output_args, false, &scheme, &host).await {
         Ok(ch) => ch,
         Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
     };
     let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok());
     let cache_key = format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}",
         scheme,
         host,
         is_kodi,
+        output_args.fcc_enabled,
         limit.unwrap_or(usize::MAX)
     );
     if let Some(text) = get_cached_text(&state.manage_json_cache, &cache_key) {
@@ -1289,7 +1314,7 @@ async fn manage_channels(
         );
     }
     let mut entries =
-        build_local_entries(channels, &state.args, &scheme, &host, playseek, 0, limit);
+        build_local_entries(channels, &output_args, &scheme, &host, playseek, 0, limit);
     if !state.args.extra_playlist.is_empty() && limit.is_none_or(|limit| entries.len() < limit) {
         let mut set = JoinSet::new();
         for (i, u) in state.args.extra_playlist.iter().enumerate() {
@@ -1440,16 +1465,21 @@ async fn manage_channels_html(
     } else {
         "${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"
     };
-    let channels = match get_channels(&state.args, false, &scheme, &host).await {
+    let output_args = match output_effective_args(&state) {
+        Ok(args) => args,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
+    };
+    let channels = match get_channels(&output_args, false, &scheme, &host).await {
         Ok(ch) => ch,
         Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
     };
     let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok());
     let cache_key = format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}",
         scheme,
         host,
         is_kodi,
+        output_args.fcc_enabled,
         limit.unwrap_or(usize::MAX)
     );
     if let Some(html) = get_cached_text(&state.manage_html_cache, &cache_key) {
@@ -1467,7 +1497,7 @@ async fn manage_channels_html(
         );
     }
     let mut entries =
-        build_local_entries(channels, &state.args, &scheme, &host, playseek, 0, limit);
+        build_local_entries(channels, &output_args, &scheme, &host, playseek, 0, limit);
     if !state.args.extra_playlist.is_empty() && limit.is_none_or(|limit| entries.len() < limit) {
         let mut set = JoinSet::new();
         for (i, u) in state.args.extra_playlist.iter().enumerate() {
@@ -1727,7 +1757,11 @@ async fn status(state: Data<AppState>, req: HttpRequest) -> impl Responder {
     };
     let scheme = req.connection_info().scheme().to_owned();
     let host = req.connection_info().host().to_owned();
-    let channels_count = match get_channels(&state.args, false, &scheme, &host).await {
+    let output_args = match output_effective_args(&state) {
+        Ok(args) => args,
+        Err(_) => state.args.clone(),
+    };
+    let channels_count = match get_channels(&output_args, false, &scheme, &host).await {
         Ok(ch) => ch.len(),
         Err(_) => 0,
     };
@@ -1899,36 +1933,45 @@ async fn udp_like(
         Err(e) => return HttpResponse::BadRequest().body(format!("Error: {}", e)),
     };
     let fcc = match params.get("fcc") {
-        Some(value) => match parse_fcc_server(value) {
-            Ok(server) if state.args.fcc_enabled => {
-                debug!(
-                    "Parsed FCC query for multicast {}: server={}, signaling_timeout={}ms, unicast_idle_timeout={}ms, max_redirects={}",
-                    addr,
-                    server,
-                    state.args.fcc_signaling_timeout_ms,
-                    state.args.fcc_unicast_idle_timeout_ms,
-                    state.args.fcc_max_redirects
-                );
-                Some(FccOptions {
-                    server,
-                    signaling_timeout_ms: state.args.fcc_signaling_timeout_ms,
-                    unicast_idle_timeout_ms: state.args.fcc_unicast_idle_timeout_ms,
-                    max_redirects: state.args.fcc_max_redirects,
-                    startup_buffer_ms: state.args.fcc_startup_buffer_ms,
-                    startup_buffer_packets: state.args.fcc_startup_buffer_packets,
-                    switch_extra_packets: state.args.fcc_switch_extra_packets,
-                    switch_min_unicast_ms: state.args.fcc_switch_min_unicast_ms,
-                })
+        Some(value) => {
+            // Read FCC tuning from the live config when a new shared UDP source
+            // is created.
+            let fcc_cfg = match state.runtime.read() {
+                Ok(guard) => guard.config.fcc.clone(),
+                Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
+            };
+            match parse_fcc_server(value) {
+                Ok(server) if fcc_cfg.enabled => {
+                    debug!(
+                        "Parsed FCC query for multicast {}: server={}, max_redirects={}, switch_extra_packets={}, switch_min_unicast_ms={}",
+                        addr,
+                        server,
+                        fcc_cfg.max_redirects,
+                        fcc_cfg.switch_extra_packets,
+                        fcc_cfg.switch_min_unicast_ms
+                    );
+                    Some(FccOptions {
+                        server,
+                        max_redirects: fcc_cfg.max_redirects,
+                        switch_extra_packets: fcc_cfg.switch_extra_packets,
+                        switch_min_unicast_ms: fcc_cfg.switch_min_unicast_ms,
+                    })
+                }
+                Ok(server) => {
+                    debug!(
+                        "Ignoring FCC query for multicast {} because FCC is disabled: server={}",
+                        addr, server
+                    );
+                    None
+                }
+                // FCC is an optional accelerator: a malformed `fcc` parameter must
+                // not fail the whole stream, just fall back to plain multicast.
+                Err(e) => {
+                    warn!("Ignoring invalid fcc query for {} ({}): {}", addr, value, e);
+                    None
+                }
             }
-            Ok(server) => {
-                debug!(
-                    "Ignoring FCC query for multicast {} because FCC is disabled: server={}",
-                    addr, server
-                );
-                None
-            }
-            Err(e) => return HttpResponse::BadRequest().body(format!("Invalid fcc query: {}", e)),
-        },
+        }
         None => None,
     };
     let mut receiver =
@@ -1941,7 +1984,6 @@ async fn udp_like(
             match receiver.recv().await {
                 Ok(bytes) => yield Ok::<Bytes, anyhow::Error>(bytes),
                 Err(SharedProxyRecvError::Lagged(n)) => {
-                    eprintln!("UDP receiver lagged by {} packets", n);
                     warn!("UDP receiver lagged by {} packets", n);
                     continue;
                 }
@@ -2004,17 +2046,13 @@ async fn main() -> std::io::Result<()> {
         }
     };
     debug!(
-        "Effective runtime config bind={} interface={:?} udp_proxy={} rtsp_proxy={} fcc_enabled={} fcc_signaling_timeout_ms={} fcc_unicast_idle_timeout_ms={} fcc_max_redirects={} fcc_startup_buffer_ms={} fcc_startup_buffer_packets={} fcc_switch_extra_packets={} fcc_switch_min_unicast_ms={}",
+        "Effective runtime config bind={} interface={:?} udp_proxy={} rtsp_proxy={} fcc_enabled={} fcc_max_redirects={} fcc_switch_extra_packets={} fcc_switch_min_unicast_ms={}",
         effective_args.bind,
         effective_args.interface,
         effective_args.udp_proxy,
         effective_args.rtsp_proxy,
         effective_args.fcc_enabled,
-        effective_args.fcc_signaling_timeout_ms,
-        effective_args.fcc_unicast_idle_timeout_ms,
         effective_args.fcc_max_redirects,
-        effective_args.fcc_startup_buffer_ms,
-        effective_args.fcc_startup_buffer_packets,
         effective_args.fcc_switch_extra_packets,
         effective_args.fcc_switch_min_unicast_ms
     );

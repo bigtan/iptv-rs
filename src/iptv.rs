@@ -4,7 +4,7 @@ use des::TdesEde3;
 use ecb::cipher::{BlockModeEncrypt, KeyInit, block_padding::Pkcs7};
 #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
 use local_ip_address::list_afinet_netifas;
-use log::{debug, info};
+use log::{debug, info, warn};
 use regex_lite::Regex;
 use reqwest::Client;
 use reqwest::Url;
@@ -226,7 +226,9 @@ pub(crate) async fn get_channels(
                             if args.udp_proxy {
                                 let mut proxied =
                                     igmp.replace("igmp://", &format!("{}://{}/udp/", scheme, host));
-                                if args.fcc_enabled && let Some(fcc) = fcc.as_ref() {
+                                if args.fcc_enabled
+                                    && let Some(fcc) = fcc.as_ref()
+                                {
                                     proxied.push_str("?fcc=");
                                     proxied.push_str(fcc);
                                 }
@@ -280,6 +282,10 @@ pub(crate) async fn get_channels(
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
 
+    // Cap concurrent EPG requests so a few hundred channels don't open a few
+    // hundred simultaneous connections to the operator's EPG endpoint (which
+    // tends to throttle or drop them).
+    let epg_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(12));
     let mut tasks = JoinSet::new();
 
     for channel in channels.into_iter() {
@@ -293,19 +299,38 @@ pub(crate) async fn get_channels(
             params,
         )?;
         let client = client.clone();
-        tasks.spawn(async move { (client.get(url).send().await, channel) });
+        let epg_limit = epg_limit.clone();
+        tasks.spawn(async move {
+            let _permit = epg_limit.acquire_owned().await;
+            (client.get(url).send().await, channel)
+        });
     }
     let mut channels = vec![];
-    while let Some(Ok((Ok(res), mut channel))) = tasks.join_next().await {
-        if let Ok(play_bill_list) = res.json::<PlaybillList>().await {
-            for bill in play_bill_list.list.into_iter() {
-                channel.epg.push(Program {
-                    start: bill.start_time,
-                    stop: bill.end_time,
-                    title: bill.name.clone(),
-                    desc: bill.name,
-                })
+    // Collect every channel regardless of per-channel EPG failures. A single
+    // failed request must not truncate the whole list (which would drop the
+    // remaining channels from the playlist/XMLTV entirely).
+    while let Some(joined) = tasks.join_next().await {
+        let (res, mut channel) = match joined {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!("EPG task join error: {}", e);
+                continue;
             }
+        };
+        match res {
+            Ok(res) => {
+                if let Ok(play_bill_list) = res.json::<PlaybillList>().await {
+                    for bill in play_bill_list.list.into_iter() {
+                        channel.epg.push(Program {
+                            start: bill.start_time,
+                            stop: bill.end_time,
+                            title: bill.name.clone(),
+                            desc: bill.name,
+                        })
+                    }
+                }
+            }
+            Err(e) => warn!("EPG fetch failed for channel {}: {}", channel.id, e),
         }
         channels.push(channel);
     }

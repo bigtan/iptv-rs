@@ -10,11 +10,7 @@ const FCC_FMT_TELECOM_TERM: u8 = 5;
 #[derive(Clone, Debug)]
 pub(crate) struct FccOptions {
     pub(crate) server: SocketAddrV4,
-    pub(crate) signaling_timeout_ms: u64,
-    pub(crate) unicast_idle_timeout_ms: u64,
     pub(crate) max_redirects: usize,
-    pub(crate) startup_buffer_ms: u64,
-    pub(crate) startup_buffer_packets: usize,
     pub(crate) switch_extra_packets: usize,
     pub(crate) switch_min_unicast_ms: u64,
 }

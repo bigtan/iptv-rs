@@ -120,33 +120,19 @@ return L.view.extend({
 		o = s.option(form.Flag, 'fcc_enabled', _('Enable FCC'));
 		o.rmempty = false;
 
-		o = s.option(form.Value, 'fcc_signaling_timeout_ms', _('Signaling timeout'));
-		o.datatype = 'uinteger';
-		o.placeholder = '80';
-
-		o = s.option(form.Value, 'fcc_unicast_idle_timeout_ms', _('Unicast idle timeout'));
-		o.datatype = 'uinteger';
-		o.placeholder = '1000';
-
 		o = s.option(form.Value, 'fcc_max_redirects', _('Max redirects'));
 		o.datatype = 'uinteger';
 		o.placeholder = '5';
 
-		o = s.option(form.Value, 'fcc_startup_buffer_ms', _('Startup buffer time'));
-		o.datatype = 'uinteger';
-		o.placeholder = '300';
-
-		o = s.option(form.Value, 'fcc_startup_buffer_packets', _('Startup buffer packets'));
-		o.datatype = 'uinteger';
-		o.placeholder = '48';
-
 		o = s.option(form.Value, 'fcc_switch_extra_packets', _('Switch extra packets'));
 		o.datatype = 'uinteger';
 		o.placeholder = '64';
+		o.description = _('Request the FCC server to keep unicast ahead of the first multicast packet by this many RTP sequence numbers.');
 
 		o = s.option(form.Value, 'fcc_switch_min_unicast_ms', _('Minimum unicast time'));
 		o.datatype = 'uinteger';
 		o.placeholder = '500';
+		o.description = _('Do not switch to multicast until FCC unicast has played for at least this long, even if the RTP sequence target is already reached.');
 
 		s = m.section(form.NamedSection, 'main', 'service', _('Extra sources'));
 		s.anonymous = true;
