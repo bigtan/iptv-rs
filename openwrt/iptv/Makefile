@@ -1,17 +1,17 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=iptv
-PKG_VERSION:=0.3.3
+PKG_VERSION:=0.3.4
 PKG_RELEASE:=1
 
 PKG_SOURCE_URL:=https://github.com/bigtan/iptv-rs/releases/download/v$(PKG_VERSION)
 
 ifeq ($(ARCH),aarch64)
   PKG_SOURCE:=iptv-rs-aarch64-unknown-linux-musl.zip
-  PKG_HASH:=67887c12a2ca325bf25befd8ca0242d8aaa619acf12e500e06a19a17af7beb7e
+  PKG_HASH:=b1b77ac48464f4effeeff636e99be7a76af3305a12a202b6a533ead011e490f5
 else ifeq ($(ARCH),x86_64)
   PKG_SOURCE:=iptv-rs-x86_64-unknown-linux-musl.zip
-  PKG_HASH:=eed67d2686e2beea243de6ff34b708ec872010a7aae3507d6497b16075f68147
+  PKG_HASH:=429ab525a6cfa1d7b7dd618e23011859c78582c48aba04ecdc6d772ac97734cb
 else
   PKG_SOURCE:=unsupported-$(ARCH).zip
   PKG_HASH:=skip
