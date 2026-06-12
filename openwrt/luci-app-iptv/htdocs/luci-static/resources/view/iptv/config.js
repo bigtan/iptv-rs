@@ -109,10 +109,10 @@ return L.view.extend({
 		o.password = true;
 
 		o = s.option(form.DynamicList, 'auth_protect', _('Protected endpoints'));
-		o.value('playlist', _('Playlist'));
-		o.value('xmltv', _('XMLTV'));
-		o.value('manage', _('Management'));
-		o.value('status', _('Status'));
+		o.value('playlist', 'playlist');
+		o.value('xmltv', 'xmltv');
+		o.value('manage', 'manage');
+		o.value('status', 'status');
 
 		s = m.section(form.NamedSection, 'main', 'service', _('FCC'));
 		s.anonymous = true;
@@ -127,12 +127,12 @@ return L.view.extend({
 		o = s.option(form.Value, 'fcc_switch_extra_packets', _('Switch extra packets'));
 		o.datatype = 'uinteger';
 		o.placeholder = '64';
-		o.description = _('Request the FCC server to keep unicast ahead of the first multicast packet by this many RTP sequence numbers.');
+		o.description = _('Request the FCC server to continue unicast this many RTP sequence numbers past the first multicast packet. Local handoff still switches at multicast overlap or the stall/deadline fallback.');
 
 		o = s.option(form.Value, 'fcc_switch_min_unicast_ms', _('Minimum unicast time'));
 		o.datatype = 'uinteger';
 		o.placeholder = '500';
-		o.description = _('Do not switch to multicast until FCC unicast has played for at least this long, even if the RTP sequence target is already reached.');
+		o.description = _('Minimum FCC unicast playback time before an overlap handoff. Stall and deadline fallbacks may switch earlier to avoid buffering freezes.');
 
 		s = m.section(form.NamedSection, 'main', 'service', _('Extra sources'));
 		s.anonymous = true;
