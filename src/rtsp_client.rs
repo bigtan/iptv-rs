@@ -501,7 +501,7 @@ fn resolve_bind_target(if_name: Option<&str>) -> Option<BindTarget> {
 
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
     {
-        return Some(BindTarget::Device(if_name.to_string()));
+        Some(BindTarget::Device(if_name.to_string()))
     }
 
     #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
