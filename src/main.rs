@@ -17,7 +17,7 @@ use std::{
     net::SocketAddrV4,
     process::exit,
     str::FromStr,
-    sync::{Mutex, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
 use xml::{
@@ -82,6 +82,8 @@ struct AppState {
     stale_xmltv: Mutex<HashMap<String, String>>,
     upstream_cache: AsyncMutex<HashMap<String, CachedChannels>>,
     icon_cache: AsyncMutex<HashMap<String, CachedBytes>>,
+    upstream_flights: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    icon_flights: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     runtime: RwLock<RuntimeConfig>,
 }
 
@@ -543,15 +545,42 @@ async fn get_channels_cached(
     host: &str,
 ) -> Result<Vec<Channel>> {
     let key = upstream_cache_key(args, need_epg, scheme, host);
-    let mut cache = state.upstream_cache.lock().await;
-    let now = std::time::Instant::now();
-    cache.retain(|_, cached| cached.expires_at > now);
-    if let Some(cached) = cache.get(&key)
-        && cached.expires_at > std::time::Instant::now()
     {
-        return Ok(cached.channels.clone());
+        let mut cache = state.upstream_cache.lock().await;
+        let now = std::time::Instant::now();
+        cache.retain(|_, cached| cached.expires_at > now);
+        if let Some(cached) = cache.get(&key) {
+            return Ok(cached.channels.clone());
+        }
     }
-    let channels = get_channels(args, need_epg, scheme, host).await?;
+
+    let flight = {
+        let mut flights = state.upstream_flights.lock().await;
+        flights
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    };
+    let _flight_guard = flight.lock().await;
+    if let Some(channels) = state
+        .upstream_cache
+        .lock()
+        .await
+        .get(&key)
+        .filter(|cached| cached.expires_at > std::time::Instant::now())
+        .map(|cached| cached.channels.clone())
+    {
+        return Ok(channels);
+    }
+
+    let channels = match get_channels(args, need_epg, scheme, host).await {
+        Ok(channels) => channels,
+        Err(error) => {
+            state.upstream_flights.lock().await.remove(&key);
+            return Err(error);
+        }
+    };
+    let mut cache = state.upstream_cache.lock().await;
     if cache.len() >= MAX_UPSTREAM_CACHE_ENTRIES
         && let Some(oldest) = cache
             .iter()
@@ -561,7 +590,7 @@ async fn get_channels_cached(
         cache.remove(&oldest);
     }
     cache.insert(
-        key,
+        key.clone(),
         CachedChannels {
             expires_at: std::time::Instant::now()
                 + if need_epg {
@@ -572,6 +601,8 @@ async fn get_channels_cached(
             channels: channels.clone(),
         },
     );
+    drop(cache);
+    state.upstream_flights.lock().await.remove(&key);
     Ok(channels)
 }
 
@@ -587,15 +618,42 @@ async fn get_icon_cached(state: &AppState, args: &EffectiveArgs, id: &str) -> Re
         ),
         id
     );
-    let mut cache = state.icon_cache.lock().await;
-    let now = std::time::Instant::now();
-    cache.retain(|_, cached| cached.expires_at > now);
-    if let Some(cached) = cache.get(&key)
-        && cached.expires_at > std::time::Instant::now()
     {
-        return Ok(cached.body.clone());
+        let mut cache = state.icon_cache.lock().await;
+        let now = std::time::Instant::now();
+        cache.retain(|_, cached| cached.expires_at > now);
+        if let Some(cached) = cache.get(&key) {
+            return Ok(cached.body.clone());
+        }
     }
-    let icon = get_icon(args, id).await?;
+
+    let flight = {
+        let mut flights = state.icon_flights.lock().await;
+        flights
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    };
+    let _flight_guard = flight.lock().await;
+    if let Some(body) = state
+        .icon_cache
+        .lock()
+        .await
+        .get(&key)
+        .filter(|cached| cached.expires_at > std::time::Instant::now())
+        .map(|cached| cached.body.clone())
+    {
+        return Ok(body);
+    }
+
+    let icon = match get_icon(args, id).await {
+        Ok(icon) => icon,
+        Err(error) => {
+            state.icon_flights.lock().await.remove(&key);
+            return Err(error);
+        }
+    };
+    let mut cache = state.icon_cache.lock().await;
     if cache.len() >= MAX_ICON_CACHE_ENTRIES
         && let Some(oldest) = cache
             .iter()
@@ -605,12 +663,14 @@ async fn get_icon_cached(state: &AppState, args: &EffectiveArgs, id: &str) -> Re
         cache.remove(&oldest);
     }
     cache.insert(
-        key,
+        key.clone(),
         CachedBytes {
             expires_at: std::time::Instant::now() + ICON_CACHE_TTL,
             body: icon.clone(),
         },
     );
+    drop(cache);
+    state.icon_flights.lock().await.remove(&key);
     Ok(icon)
 }
 
@@ -1164,6 +1224,8 @@ async fn manage_reload(state: Data<AppState>, req: HttpRequest) -> impl Responde
     }
     state.upstream_cache.lock().await.clear();
     state.icon_cache.lock().await.clear();
+    state.upstream_flights.lock().await.clear();
+    state.icon_flights.lock().await.clear();
     with_auth_cookie(
         &req,
         &response_config,
@@ -2069,6 +2131,8 @@ async fn main() -> std::io::Result<()> {
         stale_xmltv: Mutex::new(HashMap::new()),
         upstream_cache: AsyncMutex::new(HashMap::new()),
         icon_cache: AsyncMutex::new(HashMap::new()),
+        upstream_flights: AsyncMutex::new(HashMap::new()),
+        icon_flights: AsyncMutex::new(HashMap::new()),
         runtime: RwLock::new(RuntimeConfig {
             config,
             compiled,
