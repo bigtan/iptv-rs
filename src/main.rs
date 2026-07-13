@@ -31,6 +31,9 @@ use tokio::{sync::Mutex as AsyncMutex, task::JoinSet};
 mod auth;
 use auth::{check_auth, with_auth_cookie};
 
+#[cfg(test)]
+mod app_tests;
+
 mod args;
 use args::{Args, EffectiveArgs};
 

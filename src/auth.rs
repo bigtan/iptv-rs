@@ -21,10 +21,10 @@ fn extract_explicit_token(req: &HttpRequest) -> Option<String> {
     {
         return Some(token.to_string());
     }
-    req.query_string().split('&').find_map(|part| {
-        let (key, value) = part.split_once('=')?;
-        (key == "token").then(|| value.to_string())
-    })
+    reqwest::Url::parse(&format!("http://local/?{}", req.query_string()))
+        .ok()?
+        .query_pairs()
+        .find_map(|(key, value)| (key == "token").then(|| value.into_owned()))
 }
 
 fn extract_token(req: &HttpRequest) -> Option<String> {
