@@ -548,18 +548,18 @@ fn parse_sdp_presentation(
     let mut tracks = Vec::new();
     let mut in_media = false;
     let mut current_media: Option<String> = None;
-    let mut media_sections = 0usize;
 
     for raw_line in body.lines() {
         let line = raw_line.trim();
         if line.starts_with("m=") {
-            in_media = true;
-            media_sections += 1;
-            if let Some(track) = current_media.take() {
-                tracks.push(resolve_control_url(&base, request_url, &track)?);
-            } else if media_sections > 1 || tracks.is_empty() {
-                tracks.push(presentation_control.clone());
+            if in_media {
+                if let Some(track) = current_media.take() {
+                    tracks.push(resolve_control_url(&base, request_url, &track)?);
+                } else {
+                    tracks.push(presentation_control.clone());
+                }
             }
+            in_media = true;
             current_media = None;
             continue;
         }
@@ -870,5 +870,38 @@ mod tests {
         assert!(!safe.contains("user"));
         assert!(!safe.contains("secret"));
         assert!(safe.contains("example.test"));
+    }
+
+    #[test]
+    fn parses_presentation_and_track_controls() {
+        let request = Url::parse("rtsp://example.test/live?token=upstream").unwrap();
+        let presentation = parse_sdp_presentation(
+            "v=0\r\na=control:*\r\nm=video 0 RTP/AVP 33\r\na=control:track1\r\n",
+            &request,
+            "rtsp://example.test/live/",
+        )
+        .unwrap();
+
+        assert_eq!(presentation.tracks.len(), 1);
+        assert!(presentation.tracks[0].contains("track1"));
+        assert!(presentation.tracks[0].contains("token=upstream"));
+    }
+
+    #[test]
+    fn rejects_unsupported_digest_algorithm() {
+        let mut auth = AuthState {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            kind: AuthKind::Digest(DigestChallenge {
+                realm: "realm".to_string(),
+                nonce: "nonce".to_string(),
+                opaque: None,
+                algorithm: Some("SHA-256".to_string()),
+                qop: Some("auth".to_string()),
+            }),
+            nonce_count: 0,
+        };
+
+        assert!(build_auth_header(&mut auth, "PLAY", "rtsp://host/live").is_err());
     }
 }
