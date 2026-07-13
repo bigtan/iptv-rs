@@ -7,14 +7,18 @@ use log::{debug, warn};
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddrV4,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
 const MAX_PROXY_STREAMS: usize = 64;
 const BATCH_BYTES: usize = 16 * 1024;
-const BUFFER_CHUNKS: usize = 512;
+const BUFFER_CHUNKS: usize = 128;
 const BATCH_FLUSH: Duration = Duration::from_millis(2);
 
 #[derive(Clone)]
@@ -30,12 +34,12 @@ struct RegistryInner {
 struct SharedProxyHub {
     inner: Mutex<SharedProxyInner>,
     notify: Notify,
+    receivers: AtomicUsize,
 }
 
 struct SharedProxyInner {
     chunks: VecDeque<(u64, Bytes)>,
     next_seq: u64,
-    receivers: usize,
     closed: bool,
 }
 
@@ -121,16 +125,22 @@ impl SharedProxyRegistry {
         tokio::spawn(async move {
             let mut stream = Box::pin(stream);
             let mut pending = Vec::with_capacity(BATCH_BYTES);
+            let mut pending_since = None;
             loop {
                 if hub.receiver_count() == 0 {
                     break;
                 }
-                match tokio::time::timeout(BATCH_FLUSH, stream.next()).await {
+                let wait = batch_wait(pending_since, Instant::now());
+                match tokio::time::timeout(wait, stream.next()).await {
                     Ok(Some(Ok(bytes))) => {
+                        if pending.is_empty() {
+                            pending_since = Some(Instant::now());
+                        }
                         pending.extend_from_slice(bytes.as_ref());
                         if pending.len() >= BATCH_BYTES {
-                            hub.push(Bytes::from(std::mem::take(&mut pending)));
+                            flush_pending(&hub, &mut pending);
                             pending = Vec::with_capacity(BATCH_BYTES);
+                            pending_since = None;
                         }
                     }
                     Ok(Some(Err(error))) => {
@@ -145,6 +155,7 @@ impl SharedProxyRegistry {
                     Err(_) => {
                         flush_pending(&hub, &mut pending);
                         pending = Vec::with_capacity(BATCH_BYTES);
+                        pending_since = None;
                     }
                 }
             }
@@ -154,6 +165,12 @@ impl SharedProxyRegistry {
             }
         });
     }
+}
+
+fn batch_wait(pending_since: Option<Instant>, now: Instant) -> Duration {
+    pending_since
+        .map(|started| BATCH_FLUSH.saturating_sub(now.saturating_duration_since(started)))
+        .unwrap_or(BATCH_FLUSH)
 }
 
 fn flush_pending(hub: &SharedProxyHub, pending: &mut Vec<u8>) {
@@ -183,22 +200,16 @@ impl SharedProxyHub {
             inner: Mutex::new(SharedProxyInner {
                 chunks: VecDeque::with_capacity(BUFFER_CHUNKS),
                 next_seq: 0,
-                receivers: 0,
                 closed: false,
             }),
             notify: Notify::new(),
+            receivers: AtomicUsize::new(0),
         }
     }
 
     fn subscribe(self: &Arc<Self>) -> SharedProxyReceiver {
-        let next_seq = self
-            .inner
-            .lock()
-            .map(|mut inner| {
-                inner.receivers += 1;
-                inner.next_seq
-            })
-            .unwrap_or(0);
+        self.receivers.fetch_add(1, Ordering::Relaxed);
+        let next_seq = self.inner.lock().map(|inner| inner.next_seq).unwrap_or(0);
         SharedProxyReceiver {
             hub: Arc::clone(self),
             next_seq,
@@ -206,7 +217,7 @@ impl SharedProxyHub {
     }
 
     fn receiver_count(&self) -> usize {
-        self.inner.lock().map(|inner| inner.receivers).unwrap_or(0)
+        self.receivers.load(Ordering::Relaxed)
     }
 
     fn push(&self, bytes: Bytes) {
@@ -231,11 +242,7 @@ impl SharedProxyHub {
 
 impl Drop for SharedProxyReceiver {
     fn drop(&mut self) {
-        if let Ok(mut inner) = self.hub.inner.lock()
-            && inner.receivers > 0
-        {
-            inner.receivers -= 1;
-        }
+        self.hub.receivers.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -299,6 +306,20 @@ mod tests {
             receiver.recv().await,
             Err(SharedProxyRecvError::Lagged(1))
         ));
+    }
+
+    #[test]
+    fn batch_deadline_is_not_reset_by_later_packets() {
+        let started = Instant::now();
+
+        assert_eq!(
+            batch_wait(Some(started), started + Duration::from_millis(1)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            batch_wait(Some(started), started + BATCH_FLUSH),
+            Duration::ZERO
+        );
     }
 
     #[test]
