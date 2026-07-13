@@ -18,6 +18,16 @@ pub(crate) struct Config {
     pub(crate) auth: AuthConfig,
     pub(crate) manage: ManageConfig,
     pub(crate) xmltv: XmltvConfig,
+    pub(crate) proxy: ProxyConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct ProxyConfig {
+    /// Optional RTSP host allow-list. An empty list keeps backward-compatible
+    /// authenticated access; deployments exposed beyond a trusted LAN should
+    /// configure it explicitly.
+    pub(crate) allowed_rtsp_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

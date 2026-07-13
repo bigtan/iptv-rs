@@ -46,7 +46,8 @@ Example file:
 
 Key sections:
 - `[app]`: login, bind address, proxy switches
-- `[auth]`: token protection
+- `[auth]`: token protection, including optional `rtsp`, `udp`, and `logo` protection
+- `[proxy]`: optional RTSP host or `host:port` allow-list
 - `[fcc]`: FCC enablement and timeout tuning
   Uses RTP sequence numbers for multicast switchover, with a minimum unicast play time before switching.
 - `[alias]`: alias rewrite rules
@@ -78,6 +79,14 @@ If `auth.token` is configured and an endpoint is protected, you can pass the tok
 - `Authorization: Bearer <TOKEN>`
 - `X-Api-Token: <TOKEN>`
 - `?token=<TOKEN>`
+
+When `rtsp`, `udp`, or `logo` is protected, generated playlist URLs carry the
+configured token automatically. The local token is removed before an RTSP
+request is forwarded upstream.
+
+The `/rtsp` and `/udp` routes are available only when their corresponding
+proxy switch is enabled. For deployments outside a trusted LAN, protect these
+endpoints and configure `proxy.allowed_rtsp_hosts`.
 
 ## Build
 

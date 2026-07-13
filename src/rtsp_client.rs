@@ -6,6 +6,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, lookup_host};
+use tokio::time::timeout;
+
+const RTSP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const RTSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RTSP_HEADER: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 struct RtspResponse {
@@ -191,9 +196,12 @@ impl RtspClient {
         let mut redirects_left = if method == "DESCRIBE" { 4 } else { 0 };
 
         loop {
-            let response = self
-                .request_inner(method, &current_uri, headers, body)
-                .await?;
+            let response = timeout(
+                RTSP_REQUEST_TIMEOUT,
+                self.request_inner(method, &current_uri, headers, body),
+            )
+            .await
+            .with_context(|| format!("RTSP {method} timed out"))??;
             if response.status_code == 401 {
                 let Some(www_auth) = response.headers.get("www-authenticate").cloned() else {
                     bail!("RTSP auth required but WWW-Authenticate is missing");
@@ -205,9 +213,12 @@ impl RtspClient {
                 let kind = parse_auth_challenge(&www_auth)?;
                 self.auth = Some(AuthState { kind, ..current });
 
-                let retry = self
-                    .request_inner(method, &current_uri, headers, body)
-                    .await?;
+                let retry = timeout(
+                    RTSP_REQUEST_TIMEOUT,
+                    self.request_inner(method, &current_uri, headers, body),
+                )
+                .await
+                .with_context(|| format!("RTSP authenticated {method} timed out"))??;
                 return ensure_success(method, &current_uri, retry);
             }
 
@@ -235,11 +246,14 @@ impl RtspClient {
         } else {
             self.request_url.join(location)?
         };
+        let origin_changed = self.request_url.scheme() != redirected.scheme()
+            || self.request_url.host_str() != redirected.host_str()
+            || self.request_url.port_or_known_default() != redirected.port_or_known_default();
         log::info!(
             target: "iptv::proxy",
             "RTSP redirect {} -> {}",
-            self.request_url,
-            redirected
+            sanitized_url(&self.request_url),
+            sanitized_url(&redirected)
         );
         let stream = connect_tcp(&redirected, self.bind_hint.clone()).await?;
         self.stream = stream;
@@ -250,7 +264,9 @@ impl RtspClient {
         self.request_url = redirected;
         self.keepalive_uri = "*".to_string();
         self.keepalive_method = KeepaliveMethod::Options;
-        if self.auth.is_none() {
+        if origin_changed {
+            self.auth = auth_from_url(&self.request_url);
+        } else if !self.request_url.username().is_empty() {
             self.auth = auth_from_url(&self.request_url);
         }
         Ok(())
@@ -273,7 +289,7 @@ impl RtspClient {
             req.push_str(&format!("Session: {session}\r\n"));
         }
         if let Some(auth) = self.auth.as_mut() {
-            let value = build_auth_header(auth, method, uri);
+            let value = build_auth_header(auth, method, uri)?;
             req.push_str(&format!("Authorization: {value}\r\n"));
         }
         for (name, value) in headers {
@@ -289,14 +305,14 @@ impl RtspClient {
             self.stream.write_all(body).await?;
         }
         self.stream.flush().await?;
-        log::info!(target: "iptv::proxy", "RTSP {} {}", method, uri);
+        log::info!(target: "iptv::proxy", "RTSP {} {}", method, sanitized_uri(uri));
 
         let response = self.read_response().await?;
         log::info!(
             target: "iptv::proxy",
             "RTSP {} {} -> {} session={:?} content-base={:?}",
             method,
-            uri,
+            sanitized_uri(uri),
             response.status_code,
             response.headers.get("session"),
             response
@@ -349,6 +365,9 @@ impl RtspClient {
             }
             if let Some(pos) = find_double_crlf(&self.read_buf[self.read_pos..]) {
                 break pos;
+            }
+            if self.read_buf.len().saturating_sub(self.read_pos) >= MAX_RTSP_HEADER {
+                bail!("RTSP response header exceeds {MAX_RTSP_HEADER} bytes");
             }
             self.ensure_buffered(self.read_buf.len().saturating_sub(self.read_pos) + 1)
                 .await?;
@@ -450,8 +469,8 @@ async fn connect_tcp(url: &Url, if_name: Option<String>) -> Result<TcpStream> {
             }
             _ => {}
         }
-        match socket.connect(addr).await {
-            Ok(stream) => {
+        match timeout(RTSP_CONNECT_TIMEOUT, socket.connect(addr)).await {
+            Ok(Ok(stream)) => {
                 log::info!(
                     target: "iptv::proxy",
                     "RTSP connected local={:?} remote={}",
@@ -460,13 +479,12 @@ async fn connect_tcp(url: &Url, if_name: Option<String>) -> Result<TcpStream> {
                 );
                 return Ok(stream);
             }
-            Err(err) => last_err = Some(err),
+            Ok(Err(err)) => last_err = Some(anyhow::Error::from(err)),
+            Err(_) => last_err = Some(anyhow!("RTSP connect to {addr} timed out")),
         }
     }
 
-    Err(last_err
-        .map(anyhow::Error::from)
-        .unwrap_or_else(|| anyhow!("failed to resolve RTSP server")))
+    Err(last_err.unwrap_or_else(|| anyhow!("failed to resolve RTSP server")))
 }
 
 enum BindTarget {
@@ -674,11 +692,11 @@ fn parse_auth_params(input: &str) -> HashMap<String, String> {
     out
 }
 
-fn build_auth_header(auth: &mut AuthState, method: &str, uri: &str) -> String {
+fn build_auth_header(auth: &mut AuthState, method: &str, uri: &str) -> Result<String> {
     match &auth.kind {
         AuthKind::Basic => {
             let raw = format!("{}:{}", auth.username, auth.password);
-            format!("Basic {}", encode_base64(raw.as_bytes()))
+            Ok(format!("Basic {}", encode_base64(raw.as_bytes())))
         }
         AuthKind::Digest(challenge) => {
             auth.nonce_count += 1;
@@ -690,37 +708,69 @@ fn build_auth_header(auth: &mut AuthState, method: &str, uri: &str) -> String {
             let qop = challenge
                 .qop
                 .as_deref()
-                .and_then(|v| v.split(',').map(str::trim).find(|v| *v == "auth"))
-                .unwrap_or("auth");
-            let ha1 = format!(
+                .and_then(|v| v.split(',').map(str::trim).find(|v| *v == "auth"));
+            let mut ha1 = format!(
                 "{:x}",
                 md5_compute(format!(
                     "{}:{}:{}",
                     auth.username, challenge.realm, auth.password
                 ))
             );
+            match challenge.algorithm.as_deref().unwrap_or("MD5") {
+                algorithm if algorithm.eq_ignore_ascii_case("MD5") => {}
+                algorithm if algorithm.eq_ignore_ascii_case("MD5-sess") => {
+                    ha1 = format!(
+                        "{:x}",
+                        md5_compute(format!("{ha1}:{}:{cnonce}", challenge.nonce))
+                    );
+                }
+                algorithm => bail!("unsupported RTSP digest algorithm {algorithm}"),
+            }
             let ha2 = format!("{:x}", md5_compute(format!("{method}:{uri}")));
-            let response = format!(
-                "{:x}",
-                md5_compute(format!(
-                    "{ha1}:{}:{nc}:{cnonce}:{qop}:{ha2}",
-                    challenge.nonce
-                ))
-            );
+            let response = if let Some(qop) = qop {
+                format!(
+                    "{:x}",
+                    md5_compute(format!(
+                        "{ha1}:{}:{nc}:{cnonce}:{qop}:{ha2}",
+                        challenge.nonce
+                    ))
+                )
+            } else {
+                format!(
+                    "{:x}",
+                    md5_compute(format!("{ha1}:{}:{ha2}", challenge.nonce))
+                )
+            };
 
             let mut header = format!(
-                "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\", qop={}, nc={}, cnonce=\"{}\"",
-                auth.username, challenge.realm, challenge.nonce, uri, response, qop, nc, cnonce
+                "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\"",
+                auth.username, challenge.realm, challenge.nonce, uri, response
             );
+            if let Some(qop) = qop {
+                header.push_str(&format!(", qop={qop}, nc={nc}, cnonce=\"{cnonce}\""));
+            }
             if let Some(opaque) = &challenge.opaque {
                 header.push_str(&format!(", opaque=\"{opaque}\""));
             }
             if let Some(algorithm) = &challenge.algorithm {
                 header.push_str(&format!(", algorithm={algorithm}"));
             }
-            header
+            Ok(header)
         }
     }
+}
+
+fn sanitized_url(url: &Url) -> String {
+    let mut safe = url.clone();
+    let _ = safe.set_username("");
+    let _ = safe.set_password(None);
+    safe.to_string()
+}
+
+fn sanitized_uri(uri: &str) -> String {
+    Url::parse(uri)
+        .map(|url| sanitized_url(&url))
+        .unwrap_or_else(|_| uri.to_string())
 }
 
 fn encode_base64(data: &[u8]) -> String {

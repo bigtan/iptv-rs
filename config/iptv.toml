@@ -9,7 +9,11 @@ udp_proxy = true
 
 [auth]
 token = "YOUR_TOKEN"
-protect = ["playlist", "xmltv", "manage"]
+protect = ["playlist", "xmltv", "manage", "rtsp", "udp", "logo"]
+
+[proxy]
+# Leave empty to allow every RTSP host after endpoint authentication.
+allowed_rtsp_hosts = []
 
 [manage]
 enabled = true

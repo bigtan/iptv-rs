@@ -87,7 +87,7 @@ async fn fetch_channellist_raw(
 
     let token = response.json::<TokenJson>().await?.encry_token;
 
-    debug!("Got token {token}");
+    debug!("Obtained IPTV authorization token");
 
     let md5_hex = format!("{:X}", md5::compute(passwd.as_bytes()));
     let enc = ecb::Encryptor::<TdesEde3>::new_from_slice(&md5_hex.as_bytes()[0..24]);
@@ -104,7 +104,7 @@ async fn fetch_channellist_raw(
     );
     let auth = hex::encode_upper(enc.encrypt_padded_vec::<Pkcs7>(data.as_bytes()));
 
-    debug!("Got auth {auth}");
+    debug!("Built IPTV authorization response");
 
     let params = [
         ("client_id", "smcphone"),

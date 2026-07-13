@@ -157,6 +157,9 @@ generate_toml() {
 		write_option_string main auth_token token
 		write_list_array main auth_protect protect
 
+		printf '\n[proxy]\n'
+		write_list_array main allowed_rtsp_hosts allowed_rtsp_hosts
+
 		printf '\n[manage]\n'
 		write_option_bool main manage_enabled enabled
 

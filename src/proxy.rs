@@ -249,34 +249,22 @@ async fn send_fcc_termination(
     Ok(())
 }
 
-pub(crate) fn rtsp_source(
+pub(crate) async fn rtsp_source(
     url: String,
     if_name: Option<String>,
     permit: OwnedSemaphorePermit,
-) -> impl Stream<Item = Result<Bytes>> {
-    stream! {
+) -> Result<impl Stream<Item = Result<Bytes>>> {
+    let parsed = Url::parse(&url)?;
+    info!(
+        "RTSP proxy host={} port={}",
+        parsed.host_str().unwrap_or("unknown"),
+        parsed.port_or_known_default().unwrap_or(554)
+    );
+    let mut client = RtspClient::connect(parsed, if_name).await?;
+    client.describe_and_setup().await?;
+
+    Ok(stream! {
         let _permit = permit;
-        info!("RTSP proxy {url}");
-        let parsed = match Url::parse(&url) {
-            Ok(url) => url,
-            Err(err) => {
-                error!("Invalid RTSP URL: {}", err);
-                return;
-            }
-        };
-
-        let mut client = match RtspClient::connect(parsed, if_name).await {
-            Ok(client) => client,
-            Err(err) => {
-                error!("Failed to connect RTSP session: {}", err);
-                return;
-            }
-        };
-
-        if let Err(err) = client.describe_and_setup().await {
-            error!("Failed to setup RTSP session: {}", err);
-            return;
-        }
 
         let mut seq = 0u16;
         let mut last_keepalive = tokio::time::Instant::now();
@@ -314,7 +302,7 @@ pub(crate) fn rtsp_source(
             }
         }
         error!("Connection closed");
-    }
+    })
 }
 
 pub(crate) fn udp_source(

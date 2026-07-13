@@ -561,8 +561,15 @@ async fn parse_extra_playlist(client: &Client, url: &str) -> Result<String> {
 }
 
 #[get("/logo/{id}.png")]
-async fn logo(state: Data<AppState>, path: Path<String>) -> impl Responder {
+async fn logo(state: Data<AppState>, path: Path<String>, req: HttpRequest) -> impl Responder {
     debug!("Get logo");
+    match state.runtime.read() {
+        Ok(guard) if !check_auth(&req, &guard.config, "logo") => {
+            return HttpResponse::Unauthorized().body("Unauthorized");
+        }
+        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
+        _ => {}
+    }
     match get_icon(&state.args, &path).await {
         Ok(icon) => HttpResponse::Ok().content_type("image/png").body(icon),
         Err(e) => HttpResponse::NotFound().body(format!("Error getting channels: {}", e)),
@@ -885,6 +892,7 @@ async fn playlist_handler(state: Data<AppState>, req: HttpRequest) -> impl Respo
                 config: &runtime.config,
                 compiled: &runtime.compiled,
             };
+            protect_local_entry_urls(&mut entries, &runtime.config);
             let entries = finalize_entries(entries, &ctx);
             let playlist = match render_playlist(&entries, &runtime.templates) {
                 Ok(playlist) => playlist,
@@ -907,11 +915,22 @@ async fn playlist_handler(state: Data<AppState>, req: HttpRequest) -> impl Respo
 #[get("/rtsp/{tail:.*}")]
 async fn rtsp(
     state: Data<AppState>,
-    params: Query<BTreeMap<String, String>>,
+    mut params: Query<BTreeMap<String, String>>,
     req: HttpRequest,
 ) -> impl Responder {
+    let allowed_hosts = match state.runtime.read() {
+        Ok(guard) => {
+            if !state.args.rtsp_proxy {
+                return HttpResponse::NotFound().body("RTSP proxy disabled");
+            }
+            if !check_auth(&req, &guard.config, "rtsp") {
+                return HttpResponse::Unauthorized().body("Unauthorized");
+            }
+            guard.config.proxy.allowed_rtsp_hosts.clone()
+        }
+        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
+    };
     let path: String = req.match_info().query("tail").into();
-    let mut param = req.query_string().to_string();
     if !params.contains_key("playseek") && params.contains_key("utc") {
         let Some(utc) = params.get("utc") else {
             return HttpResponse::BadRequest().body("Missing utc");
@@ -938,17 +957,94 @@ async fn rtsp(
                 }
             },
         };
-        param = format!("{}&playseek={}-{}", param, start, end);
+        params.insert("playseek".to_string(), format!("{}-{}", start, end));
+    }
+    // `token` authenticates this HTTP hop and must never be forwarded to the
+    // upstream RTSP server.
+    params.remove("token");
+    let mut target = match reqwest::Url::parse(&format!("rtsp://{}", path)) {
+        Ok(url) => url,
+        Err(e) => return HttpResponse::BadRequest().body(format!("Invalid RTSP target: {e}")),
+    };
+    let host = target.host_str().unwrap_or_default();
+    let authority = match target.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    if !allowed_hosts.is_empty()
+        && !allowed_hosts.iter().any(|allowed| {
+            allowed.eq_ignore_ascii_case(host) || allowed.eq_ignore_ascii_case(&authority)
+        })
+    {
+        return HttpResponse::Forbidden().body("RTSP target is not allowed");
+    }
+    if !params.is_empty() {
+        let mut pairs = target.query_pairs_mut();
+        for (key, value) in params.iter() {
+            pairs.append_pair(key, value);
+        }
     }
     let permit = match state.proxy_slots.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => return HttpResponse::ServiceUnavailable().body("Too many active proxy streams"),
     };
-    HttpResponse::Ok().streaming(proxy::rtsp_source(
-        format!("rtsp://{}?{}", path, param),
-        state.args.interface.clone(),
-        permit,
-    ))
+    match proxy::rtsp_source(target.to_string(), state.args.interface.clone(), permit).await {
+        Ok(stream) => HttpResponse::Ok()
+            .content_type("video/mp2t")
+            .streaming(stream),
+        Err(e) => HttpResponse::BadGateway().body(format!("RTSP setup failed: {e}")),
+    }
+}
+
+fn append_auth_token(url: &str, token: &str) -> String {
+    if token.is_empty() {
+        return url.to_string();
+    }
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return url.to_string();
+    };
+    if parsed.query_pairs().any(|(key, _)| key == "token") {
+        return url.to_string();
+    }
+    parsed.query_pairs_mut().append_pair("token", token);
+    parsed.to_string()
+}
+
+fn protect_local_entry_urls(entries: &mut [ChannelEntry], config: &Config) {
+    for entry in entries.iter_mut().filter(|entry| entry.source == "gd-iptv") {
+        let endpoint = reqwest::Url::parse(&entry.url).ok().and_then(|url| {
+            let path = url.path();
+            if path.starts_with("/rtsp/") {
+                Some("rtsp")
+            } else if path.starts_with("/udp/") || path.starts_with("/rtp/") {
+                Some("udp")
+            } else {
+                None
+            }
+        });
+        if endpoint.is_some_and(|endpoint| should_protect(config, endpoint)) {
+            entry.url = append_auth_token(&entry.url, &config.auth.token);
+        }
+        if should_protect(config, "logo") {
+            entry.tvg_logo = append_auth_token(&entry.tvg_logo, &config.auth.token);
+        }
+        if !entry.catchup_source.is_empty() && should_protect(config, "rtsp") {
+            let (base, playseek) = entry
+                .catchup_source
+                .split_once("&playseek=")
+                .map(|(base, value)| (base, Some(value.to_string())))
+                .unwrap_or((&entry.catchup_source, None));
+            let protected = append_auth_token(base, &config.auth.token);
+            entry.catchup_source = match playseek {
+                Some(playseek) => format!("{protected}&playseek={playseek}"),
+                None => protected,
+            };
+            entry.catchup_attr = format!(
+                r#" catchup="default" catchup-source="{}" "#,
+                entry.catchup_source
+            );
+        }
+    }
 }
 
 #[get("/manage/config")]
@@ -1354,6 +1450,7 @@ async fn manage_channels(
         config: &runtime.config,
         compiled: &runtime.compiled,
     };
+    protect_local_entry_urls(&mut entries, &runtime.config);
     let mut entries = finalize_entries(entries, &ctx);
     if let Some(limit) = limit
         && entries.len() > limit
@@ -1537,6 +1634,7 @@ async fn manage_channels_html(
         config: &runtime.config,
         compiled: &runtime.compiled,
     };
+    protect_local_entry_urls(&mut entries, &runtime.config);
     let mut entries = finalize_entries(entries, &ctx);
     if let Some(limit) = limit
         && entries.len() > limit
@@ -1926,7 +2024,19 @@ async fn udp_like(
     state: Data<AppState>,
     addr: Path<String>,
     params: Query<BTreeMap<String, String>>,
+    req: HttpRequest,
 ) -> impl Responder {
+    match state.runtime.read() {
+        Ok(guard) => {
+            if !state.args.udp_proxy {
+                return HttpResponse::NotFound().body("UDP proxy disabled");
+            }
+            if !check_auth(&req, &guard.config, "udp") {
+                return HttpResponse::Unauthorized().body("Unauthorized");
+            }
+        }
+        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
+    }
     let addr = &*addr;
     let addr = match SocketAddrV4::from_str(addr) {
         Ok(addr) => addr,
@@ -1998,8 +2108,9 @@ async fn udp(
     state: Data<AppState>,
     addr: Path<String>,
     params: Query<BTreeMap<String, String>>,
+    req: HttpRequest,
 ) -> impl Responder {
-    udp_like(state, addr, params).await
+    udp_like(state, addr, params, req).await
 }
 
 #[get("/rtp/{addr}")]
@@ -2007,8 +2118,9 @@ async fn rtp(
     state: Data<AppState>,
     addr: Path<String>,
     params: Query<BTreeMap<String, String>>,
+    req: HttpRequest,
 ) -> impl Responder {
-    udp_like(state, addr, params).await
+    udp_like(state, addr, params, req).await
 }
 
 #[actix_web::main] // or #[tokio::main]

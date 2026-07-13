@@ -113,6 +113,12 @@ return L.view.extend({
 		o.value('xmltv', 'xmltv');
 		o.value('manage', 'manage');
 		o.value('status', 'status');
+		o.value('rtsp', 'rtsp');
+		o.value('udp', 'udp');
+		o.value('logo', 'logo');
+
+		o = s.option(form.DynamicList, 'allowed_rtsp_hosts', _('Allowed RTSP hosts'));
+		o.description = _('Optional host or host:port allow-list. Leave empty to allow any host after endpoint authentication.');
 
 		s = m.section(form.NamedSection, 'main', 'service', _('FCC'));
 		s.anonymous = true;
