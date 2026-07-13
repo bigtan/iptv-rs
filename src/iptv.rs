@@ -192,7 +192,7 @@ pub(crate) async fn get_channels(
                 .filter_map(|s| {
                     s.first()
                         .map(|a| String::from(*a))
-                        .and_then(|a| s.get(1).map(|b| String::from(*b)).map(|b| (a, b)))
+                        .zip(s.get(1).map(|b| String::from(*b)))
                 })
                 .collect::<HashMap<_, _>>()
         })

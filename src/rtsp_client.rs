@@ -264,9 +264,7 @@ impl RtspClient {
         self.request_url = redirected;
         self.keepalive_uri = "*".to_string();
         self.keepalive_method = KeepaliveMethod::Options;
-        if origin_changed {
-            self.auth = auth_from_url(&self.request_url);
-        } else if !self.request_url.username().is_empty() {
+        if origin_changed || !self.request_url.username().is_empty() {
             self.auth = auth_from_url(&self.request_url);
         }
         Ok(())
@@ -494,9 +492,7 @@ enum BindTarget {
 }
 
 fn resolve_bind_target(if_name: Option<&str>) -> Option<BindTarget> {
-    let Some(if_name) = if_name else {
-        return None;
-    };
+    let if_name = if_name?;
 
     if let Ok(ip) = if_name.parse::<IpAddr>() {
         return Some(BindTarget::Ip(ip));
@@ -839,5 +835,40 @@ fn log_play_response(headers: &HashMap<String, String>) {
         .or_else(|| headers.get("content-location"))
     {
         log::info!(target: "iptv::proxy", "RTSP PLAY Content-Base: {content_base}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn digest_without_qop_uses_legacy_response_shape() {
+        let mut auth = AuthState {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            kind: AuthKind::Digest(DigestChallenge {
+                realm: "realm".to_string(),
+                nonce: "nonce".to_string(),
+                opaque: None,
+                algorithm: Some("MD5".to_string()),
+                qop: None,
+            }),
+            nonce_count: 0,
+        };
+
+        let header = build_auth_header(&mut auth, "DESCRIBE", "rtsp://host/live").unwrap();
+        assert!(!header.contains("qop="));
+        assert!(!header.contains("cnonce="));
+    }
+
+    #[test]
+    fn sanitized_url_removes_credentials() {
+        let url = Url::parse("rtsp://user:secret@example.test/live").unwrap();
+        let safe = sanitized_url(&url);
+
+        assert!(!safe.contains("user"));
+        assert!(!safe.contains("secret"));
+        assert!(safe.contains("example.test"));
     }
 }

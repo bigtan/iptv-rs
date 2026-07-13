@@ -207,6 +207,7 @@ struct SharedProxyReceiver {
     next_seq: u64,
 }
 
+#[derive(Debug)]
 enum SharedProxyRecvError {
     Lagged(u64),
     Closed,
@@ -229,8 +230,15 @@ const MAX_UPSTREAM_CACHE_ENTRIES: usize = 32;
 const MAX_ICON_CACHE_ENTRIES: usize = 512;
 
 fn shared_udp_key(addr: &SocketAddrV4, if_name: Option<&str>, fcc: Option<&FccOptions>) -> String {
-    let fcc_server = fcc.map(|fcc| fcc.server.to_string()).unwrap_or_default();
-    format!("udp|{}|{}|{}", if_name.unwrap_or(""), addr, fcc_server)
+    let fcc_key = fcc
+        .map(|fcc| {
+            format!(
+                "{}|{}|{}|{}",
+                fcc.server, fcc.max_redirects, fcc.switch_extra_packets, fcc.switch_min_unicast_ms
+            )
+        })
+        .unwrap_or_default();
+    format!("udp|{}|{}|{}", if_name.unwrap_or(""), addr, fcc_key)
 }
 
 fn get_cached_text(cache: &Mutex<HashMap<String, CachedText>>, key: &str) -> Option<String> {
@@ -685,11 +693,7 @@ impl SharedProxyHub {
         let next_seq = match self.inner.lock() {
             Ok(mut inner) => {
                 inner.receivers += 1;
-                inner
-                    .chunks
-                    .front()
-                    .map(|(seq, _)| *seq)
-                    .unwrap_or(inner.next_seq)
+                inner.next_seq
             }
             Err(_) => 0,
         };
@@ -750,10 +754,14 @@ impl SharedProxyReceiver {
                     self.next_seq = *first_seq;
                     return Err(SharedProxyRecvError::Lagged(lagged));
                 }
-                if let Some((_, bytes)) = inner.chunks.iter().find(|(seq, _)| *seq == self.next_seq)
-                {
-                    self.next_seq += 1;
-                    return Ok(bytes.clone());
+                if let Some((first_seq, _)) = inner.chunks.front() {
+                    let offset = self.next_seq.saturating_sub(*first_seq) as usize;
+                    if let Some((seq, bytes)) = inner.chunks.get(offset)
+                        && *seq == self.next_seq
+                    {
+                        self.next_seq += 1;
+                        return Ok(bytes.clone());
+                    }
                 }
                 if inner.closed {
                     return Err(SharedProxyRecvError::Closed);
@@ -941,8 +949,7 @@ fn build_local_entries(
 ) -> Vec<ChannelEntry> {
     let capacity = limit.unwrap_or(channels.len()).min(channels.len());
     let mut entries = Vec::with_capacity(capacity);
-    let mut index = start_index;
-    for c in channels.into_iter().take(limit.unwrap_or(usize::MAX)) {
+    for (index, c) in (start_index..).zip(channels.into_iter().take(limit.unwrap_or(usize::MAX))) {
         let url = if args.udp_proxy {
             c.igmp.clone().unwrap_or_else(|| c.rtsp.clone())
         } else {
@@ -979,7 +986,6 @@ fn build_local_entries(
             original_index: index,
         };
         entries.push(entry);
-        index += 1;
     }
     entries
 }
@@ -1404,20 +1410,21 @@ async fn manage_index(state: Data<AppState>, req: HttpRequest) -> impl Responder
 
 #[post("/manage/reload")]
 async fn manage_reload(state: Data<AppState>, req: HttpRequest) -> impl Responder {
-    let current = match state.runtime.read() {
-        Ok(guard) => guard,
-        Err(_) => {
-            return HttpResponse::InternalServerError().body("Config lock poisoned");
+    let current_bind = {
+        let current = match state.runtime.read() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return HttpResponse::InternalServerError().body("Config lock poisoned");
+            }
+        };
+        if !current.config.manage.enabled {
+            return HttpResponse::NotFound().body("Manage disabled");
         }
+        if !check_auth(&req, &current.config, "manage") {
+            return HttpResponse::Unauthorized().body("Unauthorized");
+        }
+        current.effective_args.bind.clone()
     };
-    if !current.config.manage.enabled {
-        return HttpResponse::NotFound().body("Manage disabled");
-    }
-    if !check_auth(&req, &current.config, "manage") {
-        return HttpResponse::Unauthorized().body("Unauthorized");
-    }
-    let current_bind = current.effective_args.bind.clone();
-    drop(current);
 
     let path = match state.config_path.as_ref() {
         Some(path) => path.clone(),
@@ -1445,18 +1452,19 @@ async fn manage_reload(state: Data<AppState>, req: HttpRequest) -> impl Responde
         return HttpResponse::Conflict()
             .body("Bind address changed; restart the service to apply this configuration");
     }
-    let mut runtime = match state.runtime.write() {
-        Ok(guard) => guard,
-        Err(_) => {
-            return HttpResponse::InternalServerError().body("Config lock poisoned");
-        }
+    let response_config = {
+        let mut runtime = match state.runtime.write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return HttpResponse::InternalServerError().body("Config lock poisoned");
+            }
+        };
+        runtime.config = config;
+        runtime.compiled = compiled;
+        runtime.templates = templates;
+        runtime.effective_args = effective_args;
+        runtime.config.clone()
     };
-    runtime.config = config;
-    runtime.compiled = compiled;
-    runtime.templates = templates;
-    runtime.effective_args = effective_args;
-    let response_config = runtime.config.clone();
-    drop(runtime);
     if let Ok(mut cache) = state.playlist_cache.lock() {
         cache.clear();
     }
@@ -2310,6 +2318,53 @@ async fn rtp(
     req: HttpRequest,
 ) -> impl Responder {
     udp_like(state, addr, params, req).await
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+
+    #[actix_web::test]
+    async fn new_shared_proxy_subscriber_starts_at_live_edge() {
+        let hub = Arc::new(SharedProxyHub::new());
+        hub.push(Bytes::from_static(b"old"));
+        let mut receiver = hub.subscribe();
+        hub.push(Bytes::from_static(b"live"));
+
+        assert_eq!(receiver.recv().await.unwrap(), Bytes::from_static(b"live"));
+    }
+
+    #[actix_web::test]
+    async fn shared_proxy_reports_lag_after_buffer_rollover() {
+        let hub = Arc::new(SharedProxyHub::new());
+        let mut receiver = hub.subscribe();
+        for _ in 0..=SHARED_PROXY_BUFFER {
+            hub.push(Bytes::from_static(b"packet"));
+        }
+
+        assert!(matches!(
+            receiver.recv().await,
+            Err(SharedProxyRecvError::Lagged(1))
+        ));
+    }
+
+    #[test]
+    fn shared_proxy_key_changes_with_fcc_tuning() {
+        let addr = SocketAddrV4::new("239.1.1.1".parse().unwrap(), 5000);
+        let first = FccOptions {
+            server: "10.0.0.1:8027".parse().unwrap(),
+            max_redirects: 5,
+            switch_extra_packets: 64,
+            switch_min_unicast_ms: 500,
+        };
+        let mut second = first.clone();
+        second.switch_min_unicast_ms = 750;
+
+        assert_ne!(
+            shared_udp_key(&addr, Some("iptv0"), Some(&first)),
+            shared_udp_key(&addr, Some("iptv0"), Some(&second))
+        );
+    }
 }
 
 #[actix_web::main] // or #[tokio::main]
