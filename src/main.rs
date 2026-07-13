@@ -1,7 +1,5 @@
 use actix_web::{
-    App, HttpRequest, HttpResponse, HttpServer, Responder,
-    cookie::{Cookie, SameSite},
-    get,
+    App, HttpRequest, HttpResponse, HttpServer, Responder, get,
     http::header,
     post,
     web::{Bytes, Data, Path, Query},
@@ -10,19 +8,16 @@ use anyhow::{Result, anyhow};
 use async_stream::stream;
 use chrono::{FixedOffset, Local, TimeZone, Utc};
 use clap::Parser;
-use futures_core::Stream;
-use futures_util::StreamExt;
 use log::{debug, warn};
 use reqwest::Client;
 use std::{
     collections::BTreeMap,
     collections::HashMap,
-    collections::VecDeque,
     io::{BufWriter, Cursor},
     net::SocketAddrV4,
     process::exit,
     str::FromStr,
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{Mutex, OnceLock, RwLock},
     time::Duration,
 };
 use xml::{
@@ -31,99 +26,10 @@ use xml::{
     writer::{EmitterConfig, XmlEvent as XmlWriteEvent},
 };
 
-use tokio::{
-    sync::{Mutex as AsyncMutex, Notify, Semaphore},
-    task::JoinSet,
-};
+use tokio::{sync::Mutex as AsyncMutex, task::JoinSet};
 
-const AUTH_COOKIE_NAME: &str = "iptv_token";
-
-fn extract_explicit_token(req: &HttpRequest) -> Option<String> {
-    if let Some(auth) = req.headers().get(header::AUTHORIZATION)
-        && let Ok(auth_str) = auth.to_str()
-        && let Some(token) = auth_str.strip_prefix("Bearer ")
-    {
-        return Some(token.to_string());
-    }
-    if let Some(token) = req
-        .headers()
-        .get("X-Api-Token")
-        .and_then(|v| v.to_str().ok())
-    {
-        return Some(token.to_string());
-    }
-    if let Some(query) = req.uri().query() {
-        for part in query.split('&') {
-            let mut kv = part.splitn(2, '=');
-            let key = kv.next().unwrap_or("");
-            if key == "token" {
-                let value = kv.next().unwrap_or("");
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn extract_token(req: &HttpRequest) -> Option<String> {
-    if let Some(token) = extract_explicit_token(req) {
-        return Some(token);
-    }
-    req.cookie(AUTH_COOKIE_NAME)
-        .map(|cookie| cookie.value().to_string())
-}
-
-fn maybe_auth_cookie(
-    req: &HttpRequest,
-    config: &Config,
-    endpoint: &str,
-) -> Option<Cookie<'static>> {
-    if !should_protect(config, endpoint) || config.auth.token.is_empty() {
-        return None;
-    }
-    let explicit = extract_explicit_token(req)?;
-    if explicit != config.auth.token {
-        return None;
-    }
-    if req
-        .cookie(AUTH_COOKIE_NAME)
-        .is_some_and(|cookie| cookie.value() == explicit)
-    {
-        return None;
-    }
-    Some(
-        Cookie::build(AUTH_COOKIE_NAME, explicit)
-            .path("/")
-            .http_only(true)
-            .same_site(SameSite::Lax)
-            .finish(),
-    )
-}
-
-fn with_auth_cookie(
-    req: &HttpRequest,
-    config: &Config,
-    endpoint: &str,
-    mut response: HttpResponse,
-) -> HttpResponse {
-    if let Some(cookie) = maybe_auth_cookie(req, config, endpoint)
-        && let Ok(value) = header::HeaderValue::from_str(&cookie.to_string())
-    {
-        response.headers_mut().append(header::SET_COOKIE, value);
-    }
-    response
-}
-
-fn check_auth(req: &HttpRequest, config: &Config, endpoint: &str) -> bool {
-    if !should_protect(config, endpoint) {
-        return true;
-    }
-    if config.auth.token.is_empty() {
-        return true;
-    }
-    let token = extract_token(req).unwrap_or_default();
-    token == config.auth.token
-}
+mod auth;
+use auth::{check_auth, with_auth_cookie};
 
 mod args;
 use args::{Args, EffectiveArgs};
@@ -134,6 +40,7 @@ use iptv::{Channel, get_channel_list_raw, get_channels, get_icon};
 mod fcc;
 mod proxy;
 mod rtsp_client;
+mod shared_proxy;
 
 mod config;
 use config::{
@@ -141,6 +48,7 @@ use config::{
     should_protect,
 };
 use fcc::{FccOptions, parse_fcc_server};
+use shared_proxy::{SharedProxyRecvError, SharedProxyRegistry, SharedProxySubscribeError};
 
 mod playlist;
 use playlist::{
@@ -161,8 +69,7 @@ struct AppState {
     cli_args: Args,
     config_path: Option<String>,
     extra_client: Client,
-    proxy_slots: Arc<Semaphore>,
-    shared_proxies: Mutex<HashMap<String, Arc<SharedProxyHub>>>,
+    shared_proxy: SharedProxyRegistry,
     playlist_cache: Mutex<HashMap<String, CachedText>>,
     xmltv_cache: Mutex<HashMap<String, CachedText>>,
     manage_json_cache: Mutex<HashMap<String, CachedText>>,
@@ -190,35 +97,8 @@ struct CachedBytes {
     body: Vec<u8>,
 }
 
-struct SharedProxyHub {
-    inner: Mutex<SharedProxyInner>,
-    notify: Notify,
-}
-
-struct SharedProxyInner {
-    chunks: VecDeque<(u64, Bytes)>,
-    next_seq: u64,
-    receivers: usize,
-    closed: bool,
-}
-
-struct SharedProxyReceiver {
-    hub: Arc<SharedProxyHub>,
-    next_seq: u64,
-}
-
-#[derive(Debug)]
-enum SharedProxyRecvError {
-    Lagged(u64),
-    Closed,
-}
-
 const EXTRA_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const EXTRA_FETCH_MAX_BYTES: usize = 8 * 1024 * 1024;
-const MAX_PROXY_STREAMS: usize = 64;
-const SHARED_PROXY_BATCH_BYTES: usize = 16 * 1024;
-const SHARED_PROXY_BUFFER: usize = 512;
-const SHARED_PROXY_BATCH_FLUSH: Duration = Duration::from_millis(2);
 const PLAYLIST_CACHE_TTL: Duration = Duration::from_secs(30);
 const XMLTV_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const MANAGE_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -228,18 +108,6 @@ const ICON_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_OUTPUT_CACHE_ENTRIES: usize = 128;
 const MAX_UPSTREAM_CACHE_ENTRIES: usize = 32;
 const MAX_ICON_CACHE_ENTRIES: usize = 512;
-
-fn shared_udp_key(addr: &SocketAddrV4, if_name: Option<&str>, fcc: Option<&FccOptions>) -> String {
-    let fcc_key = fcc
-        .map(|fcc| {
-            format!(
-                "{}|{}|{}|{}",
-                fcc.server, fcc.max_redirects, fcc.switch_extra_packets, fcc.switch_min_unicast_ms
-            )
-        })
-        .unwrap_or_default();
-    format!("udp|{}|{}|{}", if_name.unwrap_or(""), addr, fcc_key)
-}
 
 fn get_cached_text(cache: &Mutex<HashMap<String, CachedText>>, key: &str) -> Option<String> {
     let mut cache = cache.lock().ok()?;
@@ -287,105 +155,6 @@ fn put_stale_text(cache: &Mutex<HashMap<String, String>>, key: String, body: Str
         }
         cache.insert(key, body);
     }
-}
-
-fn spawn_shared_proxy_task<S>(
-    state: Data<AppState>,
-    key: String,
-    hub: Arc<SharedProxyHub>,
-    stream: S,
-) where
-    S: Stream<Item = Result<Bytes>> + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut stream = Box::pin(stream);
-        let mut pending = Vec::with_capacity(SHARED_PROXY_BATCH_BYTES);
-        loop {
-            if hub.receiver_count() == 0 {
-                break;
-            }
-
-            match tokio::time::timeout(SHARED_PROXY_BATCH_FLUSH, stream.next()).await {
-                Ok(Some(Ok(bytes))) => {
-                    pending.extend_from_slice(bytes.as_ref());
-                    if pending.len() >= SHARED_PROXY_BATCH_BYTES {
-                        hub.push(Bytes::from(std::mem::take(&mut pending)));
-                        pending = Vec::with_capacity(SHARED_PROXY_BATCH_BYTES);
-                    }
-                }
-                Ok(Some(Err(e))) => {
-                    if !pending.is_empty() {
-                        hub.push(Bytes::from(std::mem::take(&mut pending)));
-                    }
-                    warn!("Shared proxy stream {} ended with error: {}", key, e);
-                    break;
-                }
-                Ok(None) => {
-                    if !pending.is_empty() {
-                        hub.push(Bytes::from(std::mem::take(&mut pending)));
-                    }
-                    break;
-                }
-                Err(_) => {
-                    if !pending.is_empty() {
-                        hub.push(Bytes::from(std::mem::take(&mut pending)));
-                        pending = Vec::with_capacity(SHARED_PROXY_BATCH_BYTES);
-                    }
-                }
-            }
-        }
-        hub.close();
-        if let Ok(mut shared) = state.shared_proxies.lock() {
-            shared.remove(&key);
-        }
-    });
-}
-
-fn subscribe_shared_udp(
-    state: Data<AppState>,
-    addr: SocketAddrV4,
-    if_name: Option<String>,
-    fcc: Option<FccOptions>,
-) -> Result<SharedProxyReceiver, HttpResponse> {
-    let key = shared_udp_key(&addr, if_name.as_deref(), fcc.as_ref());
-    debug!(
-        "Subscribe shared UDP key={} multicast={} interface={:?} fcc={:?}",
-        key,
-        addr,
-        if_name,
-        fcc.as_ref().map(|v| v.server)
-    );
-    if let Ok(shared) = state.shared_proxies.lock()
-        && let Some(hub) = shared.get(&key)
-    {
-        debug!("Reusing shared UDP hub for key={}", key);
-        return Ok(hub.subscribe());
-    }
-
-    let permit = match state.proxy_slots.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            return Err(HttpResponse::ServiceUnavailable().body("Too many active proxy streams"));
-        }
-    };
-    let hub = Arc::new(SharedProxyHub::new());
-    {
-        let mut shared = match state.shared_proxies.lock() {
-            Ok(shared) => shared,
-            Err(_) => {
-                return Err(HttpResponse::InternalServerError().body("Shared proxy lock poisoned"));
-            }
-        };
-        if let Some(existing) = shared.get(&key).cloned() {
-            debug!("Shared UDP hub appeared during setup for key={}", key);
-            return Ok(existing.subscribe());
-        }
-        shared.insert(key.clone(), Arc::clone(&hub));
-    }
-    let stream = proxy::udp_source(addr, if_name, fcc, permit);
-    let receiver = hub.subscribe();
-    spawn_shared_proxy_task(state, key, hub, stream);
-    Ok(receiver)
 }
 
 fn to_xmltv_time(unix_time: i64) -> Result<String> {
@@ -674,102 +443,6 @@ fn merge_arg(opt: Option<String>, fallback: Option<String>, default: &str) -> St
 
 fn merge_opt(opt: Option<String>, fallback: Option<String>) -> Option<String> {
     opt.or(fallback)
-}
-
-impl SharedProxyHub {
-    fn new() -> Self {
-        Self {
-            inner: Mutex::new(SharedProxyInner {
-                chunks: VecDeque::with_capacity(SHARED_PROXY_BUFFER),
-                next_seq: 0,
-                receivers: 0,
-                closed: false,
-            }),
-            notify: Notify::new(),
-        }
-    }
-
-    fn subscribe(self: &Arc<Self>) -> SharedProxyReceiver {
-        let next_seq = match self.inner.lock() {
-            Ok(mut inner) => {
-                inner.receivers += 1;
-                inner.next_seq
-            }
-            Err(_) => 0,
-        };
-        SharedProxyReceiver {
-            hub: Arc::clone(self),
-            next_seq,
-        }
-    }
-
-    fn receiver_count(&self) -> usize {
-        self.inner.lock().map(|inner| inner.receivers).unwrap_or(0)
-    }
-
-    fn push(&self, bytes: Bytes) {
-        if let Ok(mut inner) = self.inner.lock() {
-            let seq = inner.next_seq;
-            inner.next_seq += 1;
-            inner.chunks.push_back((seq, bytes));
-            while inner.chunks.len() > SHARED_PROXY_BUFFER {
-                inner.chunks.pop_front();
-            }
-        }
-        self.notify.notify_waiters();
-    }
-
-    fn close(&self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.closed = true;
-        }
-        self.notify.notify_waiters();
-    }
-}
-
-impl Drop for SharedProxyReceiver {
-    fn drop(&mut self) {
-        if let Ok(mut inner) = self.hub.inner.lock()
-            && inner.receivers > 0
-        {
-            inner.receivers -= 1;
-        }
-    }
-}
-
-impl SharedProxyReceiver {
-    async fn recv(&mut self) -> Result<Bytes, SharedProxyRecvError> {
-        loop {
-            let notified = self.hub.notify.notified();
-            {
-                let inner = self
-                    .hub
-                    .inner
-                    .lock()
-                    .map_err(|_| SharedProxyRecvError::Closed)?;
-                if let Some((first_seq, _)) = inner.chunks.front()
-                    && self.next_seq < *first_seq
-                {
-                    let lagged = *first_seq - self.next_seq;
-                    self.next_seq = *first_seq;
-                    return Err(SharedProxyRecvError::Lagged(lagged));
-                }
-                if let Some((first_seq, _)) = inner.chunks.front() {
-                    let offset = self.next_seq.saturating_sub(*first_seq) as usize;
-                    if let Some((seq, bytes)) = inner.chunks.get(offset)
-                        && *seq == self.next_seq
-                    {
-                        self.next_seq += 1;
-                        return Ok(bytes.clone());
-                    }
-                }
-                if inner.closed {
-                    return Err(SharedProxyRecvError::Closed);
-                }
-            }
-            notified.await;
-        }
-    }
 }
 
 fn normalize_opt(opt: Option<String>) -> Option<String> {
@@ -1164,7 +837,7 @@ async fn rtsp(
             pairs.append_pair(key, value);
         }
     }
-    let permit = match state.proxy_slots.clone().try_acquire_owned() {
+    let permit = match state.shared_proxy.try_acquire() {
         Ok(permit) => permit,
         Err(_) => return HttpResponse::ServiceUnavailable().body("Too many active proxy streams"),
     };
@@ -2281,11 +1954,18 @@ async fn udp_like(
         }
         None => None,
     };
-    let mut receiver =
-        match subscribe_shared_udp(state.clone(), addr, effective_args.interface, fcc) {
-            Ok(receiver) => receiver,
-            Err(response) => return response,
-        };
+    let mut receiver = match state
+        .shared_proxy
+        .subscribe_udp(addr, effective_args.interface, fcc)
+    {
+        Ok(receiver) => receiver,
+        Err(SharedProxySubscribeError::Busy) => {
+            return HttpResponse::ServiceUnavailable().body("Too many active proxy streams");
+        }
+        Err(SharedProxySubscribeError::Poisoned) => {
+            return HttpResponse::InternalServerError().body("Shared proxy lock poisoned");
+        }
+    };
     HttpResponse::Ok().streaming(stream! {
         loop {
             match receiver.recv().await {
@@ -2318,53 +1998,6 @@ async fn rtp(
     req: HttpRequest,
 ) -> impl Responder {
     udp_like(state, addr, params, req).await
-}
-
-#[cfg(test)]
-mod app_tests {
-    use super::*;
-
-    #[actix_web::test]
-    async fn new_shared_proxy_subscriber_starts_at_live_edge() {
-        let hub = Arc::new(SharedProxyHub::new());
-        hub.push(Bytes::from_static(b"old"));
-        let mut receiver = hub.subscribe();
-        hub.push(Bytes::from_static(b"live"));
-
-        assert_eq!(receiver.recv().await.unwrap(), Bytes::from_static(b"live"));
-    }
-
-    #[actix_web::test]
-    async fn shared_proxy_reports_lag_after_buffer_rollover() {
-        let hub = Arc::new(SharedProxyHub::new());
-        let mut receiver = hub.subscribe();
-        for _ in 0..=SHARED_PROXY_BUFFER {
-            hub.push(Bytes::from_static(b"packet"));
-        }
-
-        assert!(matches!(
-            receiver.recv().await,
-            Err(SharedProxyRecvError::Lagged(1))
-        ));
-    }
-
-    #[test]
-    fn shared_proxy_key_changes_with_fcc_tuning() {
-        let addr = SocketAddrV4::new("239.1.1.1".parse().unwrap(), 5000);
-        let first = FccOptions {
-            server: "10.0.0.1:8027".parse().unwrap(),
-            max_redirects: 5,
-            switch_extra_packets: 64,
-            switch_min_unicast_ms: 500,
-        };
-        let mut second = first.clone();
-        second.switch_min_unicast_ms = 750;
-
-        assert_ne!(
-            shared_udp_key(&addr, Some("iptv0"), Some(&first)),
-            shared_udp_key(&addr, Some("iptv0"), Some(&second))
-        );
-    }
 }
 
 #[actix_web::main] // or #[tokio::main]
@@ -2423,8 +2056,7 @@ async fn main() -> std::io::Result<()> {
                 eprintln!("Failed to build extra fetch client: {}", e);
                 exit(1);
             }),
-        proxy_slots: Arc::new(Semaphore::new(MAX_PROXY_STREAMS)),
-        shared_proxies: Mutex::new(HashMap::new()),
+        shared_proxy: SharedProxyRegistry::new(),
         playlist_cache: Mutex::new(HashMap::new()),
         xmltv_cache: Mutex::new(HashMap::new()),
         manage_json_cache: Mutex::new(HashMap::new()),
