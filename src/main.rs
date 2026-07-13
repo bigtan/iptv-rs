@@ -32,7 +32,7 @@ use xml::{
 };
 
 use tokio::{
-    sync::{Notify, Semaphore},
+    sync::{Mutex as AsyncMutex, Notify, Semaphore},
     task::JoinSet,
 };
 
@@ -148,18 +148,17 @@ use playlist::{
     finalize_entries, parse_m3u_playlist, render_playlist, resolve_group_for_alias,
 };
 
-static OLD_PLAYLIST: Mutex<Option<String>> = Mutex::new(None);
-static OLD_XMLTV: Mutex<Option<String>> = Mutex::new(None);
 static START_TIME: OnceLock<std::time::SystemTime> = OnceLock::new();
 
 struct RuntimeConfig {
     config: Config,
     compiled: CompiledConfig,
     templates: handlebars::Handlebars<'static>,
+    effective_args: EffectiveArgs,
 }
 
 struct AppState {
-    args: EffectiveArgs,
+    cli_args: Args,
     config_path: Option<String>,
     extra_client: Client,
     proxy_slots: Arc<Semaphore>,
@@ -169,12 +168,26 @@ struct AppState {
     manage_json_cache: Mutex<HashMap<String, CachedText>>,
     manage_html_cache: Mutex<HashMap<String, CachedText>>,
     manage_raw_cache: Mutex<HashMap<String, CachedText>>,
+    stale_playlists: Mutex<HashMap<String, String>>,
+    stale_xmltv: Mutex<HashMap<String, String>>,
+    upstream_cache: AsyncMutex<HashMap<String, CachedChannels>>,
+    icon_cache: AsyncMutex<HashMap<String, CachedBytes>>,
     runtime: RwLock<RuntimeConfig>,
 }
 
 struct CachedText {
     expires_at: std::time::Instant,
     body: String,
+}
+
+struct CachedChannels {
+    expires_at: std::time::Instant,
+    channels: Vec<Channel>,
+}
+
+struct CachedBytes {
+    expires_at: std::time::Instant,
+    body: Vec<u8>,
 }
 
 struct SharedProxyHub {
@@ -205,7 +218,15 @@ const MAX_PROXY_STREAMS: usize = 64;
 const SHARED_PROXY_BATCH_BYTES: usize = 16 * 1024;
 const SHARED_PROXY_BUFFER: usize = 512;
 const SHARED_PROXY_BATCH_FLUSH: Duration = Duration::from_millis(2);
-const OUTPUT_CACHE_TTL: Duration = Duration::from_secs(5);
+const PLAYLIST_CACHE_TTL: Duration = Duration::from_secs(30);
+const XMLTV_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const MANAGE_CACHE_TTL: Duration = Duration::from_secs(30);
+const CHANNEL_CACHE_TTL: Duration = Duration::from_secs(60);
+const EPG_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+const ICON_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+const MAX_OUTPUT_CACHE_ENTRIES: usize = 128;
+const MAX_UPSTREAM_CACHE_ENTRIES: usize = 32;
+const MAX_ICON_CACHE_ENTRIES: usize = 512;
 
 fn shared_udp_key(addr: &SocketAddrV4, if_name: Option<&str>, fcc: Option<&FccOptions>) -> String {
     let fcc_server = fcc.map(|fcc| fcc.server.to_string()).unwrap_or_default();
@@ -222,15 +243,41 @@ fn get_cached_text(cache: &Mutex<HashMap<String, CachedText>>, key: &str) -> Opt
     Some(cached.body.clone())
 }
 
-fn put_cached_text(cache: &Mutex<HashMap<String, CachedText>>, key: String, body: String) {
+fn put_cached_text(
+    cache: &Mutex<HashMap<String, CachedText>>,
+    key: String,
+    body: String,
+    ttl: Duration,
+) {
     if let Ok(mut cache) = cache.lock() {
+        let now = std::time::Instant::now();
+        cache.retain(|_, cached| cached.expires_at > now);
+        if cache.len() >= MAX_OUTPUT_CACHE_ENTRIES
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, cached)| cached.expires_at)
+                .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
         cache.insert(
             key,
             CachedText {
-                expires_at: std::time::Instant::now() + OUTPUT_CACHE_TTL,
+                expires_at: now + ttl,
                 body,
             },
         );
+    }
+}
+
+fn put_stale_text(cache: &Mutex<HashMap<String, String>>, key: String, body: String) {
+    if let Ok(mut cache) = cache.lock() {
+        if cache.len() >= MAX_OUTPUT_CACHE_ENTRIES
+            && let Some(key) = cache.keys().next().cloned()
+        {
+            cache.remove(&key);
+        }
+        cache.insert(key, body);
     }
 }
 
@@ -490,9 +537,9 @@ async fn xmltv(state: Data<AppState>, req: HttpRequest) -> impl Responder {
         return HttpResponse::Ok().content_type("text/xml").body(xml);
     }
     // parse all extra xmltv URLs in parallel using JoinSet, collect successful readers
-    let extra_readers = if !state.args.extra_xmltv.is_empty() {
+    let extra_readers = if !output_args.extra_xmltv.is_empty() {
         let mut set = JoinSet::new();
-        for (i, u) in state.args.extra_xmltv.iter().enumerate() {
+        for (i, u) in output_args.extra_xmltv.iter().enumerate() {
             let u = u.clone();
             let client = state.extra_client.clone();
             set.spawn(async move { (i, parse_extra_xml(&client, &u).await) });
@@ -500,19 +547,20 @@ async fn xmltv(state: Data<AppState>, req: HttpRequest) -> impl Responder {
         let mut readers = Vec::new();
         while let Some(res) = set.join_next().await {
             match res {
-                Ok((_, Ok(reader))) => readers.push(reader),
+                Ok((i, Ok(reader))) => readers.push((i, reader)),
                 Ok((i, Err(e))) => warn!(
                     "Failed to parse extra xmltv ({}): {}",
-                    state.args.extra_xmltv[i], e
+                    output_args.extra_xmltv[i], e
                 ),
                 Err(e) => warn!("Task join error parsing extra xmltv: {}", e),
             }
         }
-        readers
+        readers.sort_by_key(|(index, _)| *index);
+        readers.into_iter().map(|(_, reader)| reader).collect()
     } else {
         Vec::new()
     };
-    let xml = get_channels(&output_args, true, &scheme, &host)
+    let xml = get_channels_cached(&state, &output_args, true, &scheme, &host)
         .await
         .and_then(|mut ch| {
             if use_alias_name {
@@ -532,17 +580,25 @@ async fn xmltv(state: Data<AppState>, req: HttpRequest) -> impl Responder {
         });
     match xml {
         Err(e) => {
-            if let Some(old_xmltv) = OLD_XMLTV.try_lock().ok().and_then(|f| f.to_owned()) {
+            if let Some(old_xmltv) = state
+                .stale_xmltv
+                .lock()
+                .ok()
+                .and_then(|cache| cache.get(&cache_key).cloned())
+            {
                 HttpResponse::Ok().content_type("text/xml").body(old_xmltv)
             } else {
                 HttpResponse::InternalServerError().body(format!("Error getting channels: {}", e))
             }
         }
         Ok(xml) => {
-            put_cached_text(&state.xmltv_cache, cache_key, xml.clone());
-            if let Ok(mut old_xmltv) = OLD_XMLTV.try_lock() {
-                *old_xmltv = Some(xml.clone());
-            }
+            put_cached_text(
+                &state.xmltv_cache,
+                cache_key.clone(),
+                xml.clone(),
+                XMLTV_CACHE_TTL,
+            );
+            put_stale_text(&state.stale_xmltv, cache_key, xml.clone());
             HttpResponse::Ok().content_type("text/xml").body(xml)
         }
     }
@@ -560,6 +616,30 @@ async fn parse_extra_playlist(client: &Client, url: &str) -> Result<String> {
     }
 }
 
+async fn fetch_extra_playlists(client: &Client, urls: &[String]) -> Vec<(usize, String)> {
+    let mut set = JoinSet::new();
+    for (index, url) in urls.iter().cloned().enumerate() {
+        let client = client.clone();
+        set.spawn(async move {
+            (
+                index,
+                url.clone(),
+                parse_extra_playlist(&client, &url).await,
+            )
+        });
+    }
+    let mut playlists = Vec::new();
+    while let Some(result) = set.join_next().await {
+        match result {
+            Ok((index, _, Ok(content))) => playlists.push((index, content)),
+            Ok((_, url, Err(error))) => warn!("Failed to parse extra playlist ({url}): {error}"),
+            Err(error) => warn!("Task join error parsing extra playlist: {error}"),
+        }
+    }
+    playlists.sort_by_key(|(index, _)| *index);
+    playlists
+}
+
 #[get("/logo/{id}.png")]
 async fn logo(state: Data<AppState>, path: Path<String>, req: HttpRequest) -> impl Responder {
     debug!("Get logo");
@@ -570,7 +650,11 @@ async fn logo(state: Data<AppState>, path: Path<String>, req: HttpRequest) -> im
         Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
         _ => {}
     }
-    match get_icon(&state.args, &path).await {
+    let args = match output_effective_args(&state) {
+        Ok(args) => args,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {e}")),
+    };
+    match get_icon_cached(&state, &args, &path).await {
         Ok(icon) => HttpResponse::Ok().content_type("image/png").body(icon),
         Err(e) => HttpResponse::NotFound().body(format!("Error getting channels: {}", e)),
     }
@@ -746,12 +830,104 @@ fn output_effective_args(state: &AppState) -> Result<EffectiveArgs> {
         .runtime
         .read()
         .map_err(|_| anyhow!("Config lock poisoned"))?;
-    let mut args = state.args.clone();
-    args.fcc_enabled = runtime.config.fcc.enabled;
-    args.fcc_max_redirects = runtime.config.fcc.max_redirects;
-    args.fcc_switch_extra_packets = runtime.config.fcc.switch_extra_packets;
-    args.fcc_switch_min_unicast_ms = runtime.config.fcc.switch_min_unicast_ms;
-    Ok(args)
+    Ok(runtime.effective_args.clone())
+}
+
+fn upstream_cache_key(args: &EffectiveArgs, need_epg: bool, scheme: &str, host: &str) -> String {
+    let identity = format!(
+        "{}\0{}\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{}\0{}",
+        args.user,
+        args.passwd,
+        args.mac,
+        args.imei,
+        args.address,
+        args.interface,
+        args.udp_proxy,
+        args.rtsp_proxy,
+        args.fcc_enabled,
+        scheme,
+        host
+    );
+    format!("{:x}|epg={need_epg}", md5::compute(identity.as_bytes()))
+}
+
+async fn get_channels_cached(
+    state: &AppState,
+    args: &EffectiveArgs,
+    need_epg: bool,
+    scheme: &str,
+    host: &str,
+) -> Result<Vec<Channel>> {
+    let key = upstream_cache_key(args, need_epg, scheme, host);
+    let mut cache = state.upstream_cache.lock().await;
+    let now = std::time::Instant::now();
+    cache.retain(|_, cached| cached.expires_at > now);
+    if let Some(cached) = cache.get(&key)
+        && cached.expires_at > std::time::Instant::now()
+    {
+        return Ok(cached.channels.clone());
+    }
+    let channels = get_channels(args, need_epg, scheme, host).await?;
+    if cache.len() >= MAX_UPSTREAM_CACHE_ENTRIES
+        && let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, cached)| cached.expires_at)
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&oldest);
+    }
+    cache.insert(
+        key,
+        CachedChannels {
+            expires_at: std::time::Instant::now()
+                + if need_epg {
+                    EPG_CACHE_TTL
+                } else {
+                    CHANNEL_CACHE_TTL
+                },
+            channels: channels.clone(),
+        },
+    );
+    Ok(channels)
+}
+
+async fn get_icon_cached(state: &AppState, args: &EffectiveArgs, id: &str) -> Result<Vec<u8>> {
+    let key = format!(
+        "{:x}|{}",
+        md5::compute(
+            format!(
+                "{}\0{}\0{}\0{:?}",
+                args.user, args.passwd, args.mac, args.interface
+            )
+            .as_bytes()
+        ),
+        id
+    );
+    let mut cache = state.icon_cache.lock().await;
+    let now = std::time::Instant::now();
+    cache.retain(|_, cached| cached.expires_at > now);
+    if let Some(cached) = cache.get(&key)
+        && cached.expires_at > std::time::Instant::now()
+    {
+        return Ok(cached.body.clone());
+    }
+    let icon = get_icon(args, id).await?;
+    if cache.len() >= MAX_ICON_CACHE_ENTRIES
+        && let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, cached)| cached.expires_at)
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&oldest);
+    }
+    cache.insert(
+        key,
+        CachedBytes {
+            expires_at: std::time::Instant::now() + ICON_CACHE_TTL,
+            body: icon.clone(),
+        },
+    );
+    Ok(icon)
 }
 
 fn build_local_entries(
@@ -844,9 +1020,14 @@ async fn playlist_handler(state: Data<AppState>, req: HttpRequest) -> impl Respo
             .content_type("application/vnd.apple.mpegurl")
             .body(playlist);
     }
-    match get_channels(&output_args, false, &scheme, &host).await {
+    match get_channels_cached(&state, &output_args, false, &scheme, &host).await {
         Err(e) => {
-            if let Some(old_playlist) = OLD_PLAYLIST.try_lock().ok().and_then(|f| f.to_owned()) {
+            if let Some(old_playlist) = state
+                .stale_playlists
+                .lock()
+                .ok()
+                .and_then(|cache| cache.get(&cache_key).cloned())
+            {
                 HttpResponse::Ok()
                     .content_type("application/vnd.apple.mpegurl")
                     .body(old_playlist)
@@ -857,28 +1038,15 @@ async fn playlist_handler(state: Data<AppState>, req: HttpRequest) -> impl Respo
         Ok(ch) => {
             let mut entries =
                 build_local_entries(ch, &output_args, &scheme, &host, playseek, 0, None);
-            if !state.args.extra_playlist.is_empty() {
-                let mut set = JoinSet::new();
-                for (i, u) in state.args.extra_playlist.iter().enumerate() {
-                    let u = u.clone();
-                    let client = state.extra_client.clone();
-                    set.spawn(async move { (i, parse_extra_playlist(&client, &u).await) });
-                }
+            if !output_args.extra_playlist.is_empty() {
                 let mut index = entries.len();
-                while let Some(res) = set.join_next().await {
-                    match res {
-                        Ok((i, Ok(s))) => {
-                            let source = format!("extra:{}", i);
-                            let mut extra_entries = parse_m3u_playlist(&s, &source, index);
-                            index += extra_entries.len();
-                            entries.append(&mut extra_entries);
-                        }
-                        Ok((i, Err(e))) => warn!(
-                            "Failed to parse extra playlist ({}): {}",
-                            state.args.extra_playlist[i], e
-                        ),
-                        Err(e) => warn!("Task join error parsing extra playlist: {}", e),
-                    }
+                for (source_index, content) in
+                    fetch_extra_playlists(&state.extra_client, &output_args.extra_playlist).await
+                {
+                    let source = format!("extra:{source_index}");
+                    let mut extra_entries = parse_m3u_playlist(&content, &source, index);
+                    index += extra_entries.len();
+                    entries.append(&mut extra_entries);
                 }
             }
 
@@ -901,10 +1069,13 @@ async fn playlist_handler(state: Data<AppState>, req: HttpRequest) -> impl Respo
                         .body(format!("Template render error: {}", e));
                 }
             };
-            put_cached_text(&state.playlist_cache, cache_key, playlist.clone());
-            if let Ok(mut old_playlist) = OLD_PLAYLIST.try_lock() {
-                *old_playlist = Some(playlist.clone());
-            }
+            put_cached_text(
+                &state.playlist_cache,
+                cache_key.clone(),
+                playlist.clone(),
+                PLAYLIST_CACHE_TTL,
+            );
+            put_stale_text(&state.stale_playlists, cache_key, playlist.clone());
             HttpResponse::Ok()
                 .content_type("application/vnd.apple.mpegurl")
                 .body(playlist)
@@ -918,15 +1089,18 @@ async fn rtsp(
     mut params: Query<BTreeMap<String, String>>,
     req: HttpRequest,
 ) -> impl Responder {
-    let allowed_hosts = match state.runtime.read() {
+    let (allowed_hosts, effective_args) = match state.runtime.read() {
         Ok(guard) => {
-            if !state.args.rtsp_proxy {
+            if !guard.effective_args.rtsp_proxy {
                 return HttpResponse::NotFound().body("RTSP proxy disabled");
             }
             if !check_auth(&req, &guard.config, "rtsp") {
                 return HttpResponse::Unauthorized().body("Unauthorized");
             }
-            guard.config.proxy.allowed_rtsp_hosts.clone()
+            (
+                guard.config.proxy.allowed_rtsp_hosts.clone(),
+                guard.effective_args.clone(),
+            )
         }
         Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
     };
@@ -988,7 +1162,7 @@ async fn rtsp(
         Ok(permit) => permit,
         Err(_) => return HttpResponse::ServiceUnavailable().body("Too many active proxy streams"),
     };
-    match proxy::rtsp_source(target.to_string(), state.args.interface.clone(), permit).await {
+    match proxy::rtsp_source(target.to_string(), effective_args.interface, permit).await {
         Ok(stream) => HttpResponse::Ok()
             .content_type("video/mp2t")
             .streaming(stream),
@@ -1242,6 +1416,7 @@ async fn manage_reload(state: Data<AppState>, req: HttpRequest) -> impl Responde
     if !check_auth(&req, &current.config, "manage") {
         return HttpResponse::Unauthorized().body("Unauthorized");
     }
+    let current_bind = current.effective_args.bind.clone();
     drop(current);
 
     let path = match state.config_path.as_ref() {
@@ -1262,6 +1437,14 @@ async fn manage_reload(state: Data<AppState>, req: HttpRequest) -> impl Responde
         Ok(t) => t,
         Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
     };
+    let effective_args = match build_effective_args(&state.cli_args, &config) {
+        Ok(args) => args,
+        Err(e) => return HttpResponse::BadRequest().body(format!("Error: {e}")),
+    };
+    if effective_args.bind != current_bind {
+        return HttpResponse::Conflict()
+            .body("Bind address changed; restart the service to apply this configuration");
+    }
     let mut runtime = match state.runtime.write() {
         Ok(guard) => guard,
         Err(_) => {
@@ -1271,6 +1454,9 @@ async fn manage_reload(state: Data<AppState>, req: HttpRequest) -> impl Responde
     runtime.config = config;
     runtime.compiled = compiled;
     runtime.templates = templates;
+    runtime.effective_args = effective_args;
+    let response_config = runtime.config.clone();
+    drop(runtime);
     if let Ok(mut cache) = state.playlist_cache.lock() {
         cache.clear();
     }
@@ -1286,9 +1472,17 @@ async fn manage_reload(state: Data<AppState>, req: HttpRequest) -> impl Responde
     if let Ok(mut cache) = state.manage_raw_cache.lock() {
         cache.clear();
     }
+    if let Ok(mut cache) = state.stale_playlists.lock() {
+        cache.clear();
+    }
+    if let Ok(mut cache) = state.stale_xmltv.lock() {
+        cache.clear();
+    }
+    state.upstream_cache.lock().await.clear();
+    state.icon_cache.lock().await.clear();
     with_auth_cookie(
         &req,
-        &runtime.config,
+        &response_config,
         "manage",
         HttpResponse::Ok().body("OK"),
     )
@@ -1382,10 +1576,6 @@ async fn manage_channels(
         Ok(args) => args,
         Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
     };
-    let channels = match get_channels(&output_args, false, &scheme, &host).await {
-        Ok(ch) => ch,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
-    };
     let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok());
     let cache_key = format!(
         "{}|{}|{}|{}|{}",
@@ -1409,36 +1599,27 @@ async fn manage_channels(
                 .body(text),
         );
     }
+    let channels = match get_channels_cached(&state, &output_args, false, &scheme, &host).await {
+        Ok(ch) => ch,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
+    };
     let mut entries =
         build_local_entries(channels, &output_args, &scheme, &host, playseek, 0, limit);
-    if !state.args.extra_playlist.is_empty() && limit.is_none_or(|limit| entries.len() < limit) {
-        let mut set = JoinSet::new();
-        for (i, u) in state.args.extra_playlist.iter().enumerate() {
-            let u = u.clone();
-            let client = state.extra_client.clone();
-            set.spawn(async move { (i, parse_extra_playlist(&client, &u).await) });
-        }
+    if !output_args.extra_playlist.is_empty() && limit.is_none_or(|limit| entries.len() < limit) {
         let mut index = entries.len();
-        while let Some(res) = set.join_next().await {
-            match res {
-                Ok((i, Ok(s))) => {
-                    let source = format!("extra:{}", i);
-                    let mut extra_entries = parse_m3u_playlist(&s, &source, index);
-                    if let Some(limit) = limit {
-                        let remaining = limit.saturating_sub(entries.len());
-                        extra_entries.truncate(remaining);
-                    }
-                    index += extra_entries.len();
-                    entries.append(&mut extra_entries);
-                    if limit.is_some_and(|limit| entries.len() >= limit) {
-                        break;
-                    }
-                }
-                Ok((i, Err(e))) => warn!(
-                    "Failed to parse extra playlist ({}): {}",
-                    state.args.extra_playlist[i], e
-                ),
-                Err(e) => warn!("Task join error parsing extra playlist: {}", e),
+        for (source_index, content) in
+            fetch_extra_playlists(&state.extra_client, &output_args.extra_playlist).await
+        {
+            let source = format!("extra:{source_index}");
+            let mut extra_entries = parse_m3u_playlist(&content, &source, index);
+            if let Some(limit) = limit {
+                let remaining = limit.saturating_sub(entries.len());
+                extra_entries.truncate(remaining);
+            }
+            index += extra_entries.len();
+            entries.append(&mut extra_entries);
+            if limit.is_some_and(|limit| entries.len() >= limit) {
+                break;
             }
         }
     }
@@ -1459,7 +1640,12 @@ async fn manage_channels(
     }
     match serde_json::to_string_pretty(&entries) {
         Ok(text) => {
-            put_cached_text(&state.manage_json_cache, cache_key, text.clone());
+            put_cached_text(
+                &state.manage_json_cache,
+                cache_key,
+                text.clone(),
+                MANAGE_CACHE_TTL,
+            );
             with_auth_cookie(
                 &req,
                 &runtime.config,
@@ -1507,11 +1693,20 @@ async fn manage_channels_raw(state: Data<AppState>, req: HttpRequest) -> impl Re
                 .body(text),
         );
     }
-    let text = match get_channel_list_raw(&state.args).await {
+    let output_args = match output_effective_args(&state) {
+        Ok(args) => args,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {e}")),
+    };
+    let text = match get_channel_list_raw(&output_args).await {
         Ok(text) => text,
         Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
     };
-    put_cached_text(&state.manage_raw_cache, cache_key, text.clone());
+    put_cached_text(
+        &state.manage_raw_cache,
+        cache_key,
+        text.clone(),
+        MANAGE_CACHE_TTL,
+    );
     let runtime = match state.runtime.read() {
         Ok(guard) => guard,
         Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
@@ -1566,10 +1761,6 @@ async fn manage_channels_html(
         Ok(args) => args,
         Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
     };
-    let channels = match get_channels(&output_args, false, &scheme, &host).await {
-        Ok(ch) => ch,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
-    };
     let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok());
     let cache_key = format!(
         "{}|{}|{}|{}|{}",
@@ -1593,36 +1784,27 @@ async fn manage_channels_html(
                 .body(html),
         );
     }
+    let channels = match get_channels_cached(&state, &output_args, false, &scheme, &host).await {
+        Ok(ch) => ch,
+        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
+    };
     let mut entries =
         build_local_entries(channels, &output_args, &scheme, &host, playseek, 0, limit);
-    if !state.args.extra_playlist.is_empty() && limit.is_none_or(|limit| entries.len() < limit) {
-        let mut set = JoinSet::new();
-        for (i, u) in state.args.extra_playlist.iter().enumerate() {
-            let u = u.clone();
-            let client = state.extra_client.clone();
-            set.spawn(async move { (i, parse_extra_playlist(&client, &u).await) });
-        }
+    if !output_args.extra_playlist.is_empty() && limit.is_none_or(|limit| entries.len() < limit) {
         let mut index = entries.len();
-        while let Some(res) = set.join_next().await {
-            match res {
-                Ok((i, Ok(s))) => {
-                    let source = format!("extra:{}", i);
-                    let mut extra_entries = parse_m3u_playlist(&s, &source, index);
-                    if let Some(limit) = limit {
-                        let remaining = limit.saturating_sub(entries.len());
-                        extra_entries.truncate(remaining);
-                    }
-                    index += extra_entries.len();
-                    entries.append(&mut extra_entries);
-                    if limit.is_some_and(|limit| entries.len() >= limit) {
-                        break;
-                    }
-                }
-                Ok((i, Err(e))) => warn!(
-                    "Failed to parse extra playlist ({}): {}",
-                    state.args.extra_playlist[i], e
-                ),
-                Err(e) => warn!("Task join error parsing extra playlist: {}", e),
+        for (source_index, content) in
+            fetch_extra_playlists(&state.extra_client, &output_args.extra_playlist).await
+        {
+            let source = format!("extra:{source_index}");
+            let mut extra_entries = parse_m3u_playlist(&content, &source, index);
+            if let Some(limit) = limit {
+                let remaining = limit.saturating_sub(entries.len());
+                extra_entries.truncate(remaining);
+            }
+            index += extra_entries.len();
+            entries.append(&mut extra_entries);
+            if limit.is_some_and(|limit| entries.len() >= limit) {
+                break;
             }
         }
     }
@@ -1756,7 +1938,12 @@ async fn manage_channels_html(
         count = count,
         limit = limit,
     );
-    put_cached_text(&state.manage_html_cache, cache_key, html.clone());
+    put_cached_text(
+        &state.manage_html_cache,
+        cache_key,
+        html.clone(),
+        MANAGE_CACHE_TTL,
+    );
     with_auth_cookie(
         &req,
         &runtime.config,
@@ -1857,12 +2044,13 @@ async fn status(state: Data<AppState>, req: HttpRequest) -> impl Responder {
     let host = req.connection_info().host().to_owned();
     let output_args = match output_effective_args(&state) {
         Ok(args) => args,
-        Err(_) => state.args.clone(),
+        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
     };
-    let channels_count = match get_channels(&output_args, false, &scheme, &host).await {
-        Ok(ch) => ch.len(),
-        Err(_) => 0,
-    };
+    let channels_count =
+        match get_channels_cached(&state, &output_args, false, &scheme, &host).await {
+            Ok(ch) => ch.len(),
+            Err(_) => 0,
+        };
     let html = format!(
         r#"<!doctype html>
 <html lang="zh-CN">
@@ -1997,8 +2185,8 @@ async fn status(state: Data<AppState>, req: HttpRequest) -> impl Responder {
         manage_enabled = manage_enabled,
         protected = protected,
         token_set = if token_set == "yes" { "Active" } else { "None" },
-        extra_playlist = state.args.extra_playlist.len(),
-        extra_xmltv = state.args.extra_xmltv.len(),
+        extra_playlist = output_args.extra_playlist.len(),
+        extra_xmltv = output_args.extra_xmltv.len(),
         channels_count = channels_count,
         alias_rules = alias_rules,
         alias_preview = alias_preview,
@@ -2026,17 +2214,18 @@ async fn udp_like(
     params: Query<BTreeMap<String, String>>,
     req: HttpRequest,
 ) -> impl Responder {
-    match state.runtime.read() {
+    let effective_args = match state.runtime.read() {
         Ok(guard) => {
-            if !state.args.udp_proxy {
+            if !guard.effective_args.udp_proxy {
                 return HttpResponse::NotFound().body("UDP proxy disabled");
             }
             if !check_auth(&req, &guard.config, "udp") {
                 return HttpResponse::Unauthorized().body("Unauthorized");
             }
+            guard.effective_args.clone()
         }
         Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-    }
+    };
     let addr = &*addr;
     let addr = match SocketAddrV4::from_str(addr) {
         Ok(addr) => addr,
@@ -2085,7 +2274,7 @@ async fn udp_like(
         None => None,
     };
     let mut receiver =
-        match subscribe_shared_udp(state.clone(), addr, state.args.interface.clone(), fcc) {
+        match subscribe_shared_udp(state.clone(), addr, effective_args.interface, fcc) {
             Ok(receiver) => receiver,
             Err(response) => return response,
         };
@@ -2170,7 +2359,7 @@ async fn main() -> std::io::Result<()> {
     );
 
     let state = Data::new(AppState {
-        args: effective_args.clone(),
+        cli_args: args.clone(),
         config_path: args.config.clone(),
         extra_client: Client::builder()
             .timeout(EXTRA_FETCH_TIMEOUT)
@@ -2186,10 +2375,15 @@ async fn main() -> std::io::Result<()> {
         manage_json_cache: Mutex::new(HashMap::new()),
         manage_html_cache: Mutex::new(HashMap::new()),
         manage_raw_cache: Mutex::new(HashMap::new()),
+        stale_playlists: Mutex::new(HashMap::new()),
+        stale_xmltv: Mutex::new(HashMap::new()),
+        upstream_cache: AsyncMutex::new(HashMap::new()),
+        icon_cache: AsyncMutex::new(HashMap::new()),
         runtime: RwLock::new(RuntimeConfig {
             config,
             compiled,
             templates,
+            effective_args: effective_args.clone(),
         }),
     });
 

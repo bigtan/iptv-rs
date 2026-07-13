@@ -127,6 +127,7 @@ async fn fetch_channellist_raw(
     response.text().await.map_err(Into::into)
 }
 
+#[derive(Clone)]
 pub(crate) struct Program {
     pub(crate) start: i64,
     pub(crate) stop: i64,
@@ -134,6 +135,7 @@ pub(crate) struct Program {
     pub(crate) desc: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct Channel {
     pub(crate) id: u64,
     pub(crate) name: String,
@@ -334,6 +336,8 @@ pub(crate) async fn get_channels(
         }
         channels.push(channel);
     }
+
+    channels.sort_by_key(|channel| channel.id);
 
     Ok(channels)
 }
