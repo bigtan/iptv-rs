@@ -9,7 +9,20 @@ permissions:
   contents: write
 
 jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run tests
+        run: cargo test --all-features
+
   build:
+    needs: quality
     name: Build (${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
@@ -36,9 +49,11 @@ jobs:
           set -e
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/iptv-rs" "dist/iptv-rs"
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md dist/
           (
             cd dist
-            zip "../iptv-rs-${{ matrix.target }}.zip" "iptv-rs"
+            zip "../iptv-rs-${{ matrix.target }}.zip" \
+              "iptv-rs" "LICENSE" "NOTICE" "THIRD_PARTY_NOTICES.md"
           )
       - name: Upload zipped binary
         uses: actions/upload-artifact@v7
