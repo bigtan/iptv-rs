@@ -281,8 +281,9 @@ pub(crate) async fn rtsp_source(
                         }
                         if let Ok(rtp) = RtpReader::new(payload.as_ref()) {
                             let next: u16 = rtp.sequence_number().into();
+                            let payload_offset = rtp.payload_offset();
                             if filter_reordered_seq(&mut seq, next) {
-                                yield Ok(Bytes::copy_from_slice(rtp.payload()));
+                                yield Ok(payload.slice(payload_offset..));
                             }
                         }
                     }
@@ -723,9 +724,8 @@ pub(crate) fn udp_source(
                                     unicast_started_at = Some(now);
                                 }
                                 state = FccState::UnicastActive;
-                                let payload = Bytes::copy_from_slice(rtp.payload());
                                 if filter_reordered_seq(&mut seq, next) {
-                                    yield Ok(payload);
+                                    yield Ok(Bytes::copy_from_slice(rtp.payload()));
                                 }
                                 // Seamless point: once the unicast catches up to the head of
                                 // the buffered multicast, hand off (overlap).

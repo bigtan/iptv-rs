@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::time::timeout;
+use tokio_util::bytes::Bytes;
 
 const RTSP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RTSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -139,7 +140,7 @@ impl RtspClient {
             self.ensure_buffered(4 + len).await?;
             let start = self.read_pos + 4;
             let end = start + len;
-            let payload = self.read_buf[start..end].to_vec();
+            let payload = Bytes::copy_from_slice(&self.read_buf[start..end]);
             self.consume(end - self.read_pos);
             Ok(RtspMessage::Interleaved { channel, payload })
         } else {
@@ -442,7 +443,7 @@ impl RtspClient {
 
 pub(crate) enum RtspMessage {
     Response,
-    Interleaved { channel: u8, payload: Vec<u8> },
+    Interleaved { channel: u8, payload: Bytes },
 }
 
 async fn connect_tcp(url: &Url, if_name: Option<String>) -> Result<TcpStream> {
