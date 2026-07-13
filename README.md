@@ -96,6 +96,9 @@ Native build:
 cargo build --release
 ```
 
+Release builds optimize the media forwarding hot path for throughput. If binary
+size matters more than CPU usage, use `cargo build --profile release-small`.
+
 Cross build:
 
 ```bash
