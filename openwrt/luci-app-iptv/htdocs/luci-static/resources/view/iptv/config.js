@@ -167,6 +167,9 @@ return L.view.extend({
 		o = s.option(form.DynamicList, 'prefer_resolution', _('Preferred resolution labels'));
 		o.placeholder = 'R4K Uhd Fhd Hd Sd Unknown';
 
+		o = s.option(form.DynamicList, 'source_priority', _('Source priority'));
+		o.placeholder = 'gd-iptv extra:0';
+
 		o = s.option(form.Flag, 'xmltv_use_alias_name', _('Use alias names in XMLTV'));
 		o.rmempty = false;
 

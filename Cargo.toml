@@ -6,6 +6,7 @@ license = "AGPL-3.0-only"
 description = "Independent Rust IPTV proxy with native RTSP replay and multicast proxy support"
 
 [features]
+default = ["rustls"]
 http2 = ["reqwest/http2"]
 tls = ["reqwest/native-tls"]
 rustls = ["reqwest/rustls"]

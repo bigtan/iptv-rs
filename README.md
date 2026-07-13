@@ -105,8 +105,9 @@ cargo cross build --release --target x86_64-unknown-linux-musl
 
 TLS feature selection:
 
-- `--features rustls` for Rustls
-- `--features tls` for native TLS/OpenSSL
+- Rustls is enabled by default so HTTPS extra playlists/XMLTV work in release builds
+- `--no-default-features --features tls` for native TLS/OpenSSL
+- `--no-default-features` for an HTTP-only minimal build
 
 ## Service Example
 

@@ -186,6 +186,7 @@ generate_toml() {
 
 		printf '\n[sorting]\n'
 		write_list_array main same_alias same_alias
+		write_list_array main source_priority source_priority
 		printf '\n[sorting.prefer_resolution]\n'
 		write_list_array main prefer_resolution order
 

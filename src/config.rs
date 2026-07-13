@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 #[derive(Default)]
 pub(crate) struct Config {
     pub(crate) app: AppConfig,
@@ -22,7 +22,7 @@ pub(crate) struct Config {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct ProxyConfig {
     /// Optional RTSP host allow-list. An empty list keeps backward-compatible
     /// authenticated access; deployments exposed beyond a trusted LAN should
@@ -31,7 +31,7 @@ pub(crate) struct ProxyConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 #[derive(Default)]
 pub(crate) struct AppConfig {
     pub(crate) user: Option<String>,
@@ -46,7 +46,7 @@ pub(crate) struct AppConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct FccConfig {
     pub(crate) enabled: bool,
     pub(crate) max_redirects: usize,
@@ -66,7 +66,7 @@ impl Default for FccConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct AliasConfig {
     pub(crate) mode: AliasMode,
     pub(crate) rules: Vec<AliasRule>,
@@ -96,6 +96,7 @@ pub(crate) enum AliasRuleType {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AliasRule {
     #[serde(rename = "type")]
     pub(crate) kind: AliasRuleType,
@@ -104,7 +105,7 @@ pub(crate) struct AliasRule {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 #[derive(Default)]
 pub(crate) struct ResolutionConfig {
     pub(crate) default_score: i32,
@@ -112,6 +113,7 @@ pub(crate) struct ResolutionConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ResolutionRule {
     pub(crate) pattern: String,
     pub(crate) score: i32,
@@ -119,7 +121,7 @@ pub(crate) struct ResolutionRule {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct GroupConfig {
     pub(crate) default_group: String,
     pub(crate) entries: Vec<GroupEntry>,
@@ -135,6 +137,7 @@ impl Default for GroupConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GroupEntry {
     pub(crate) group: String,
     pub(crate) channels: Option<Vec<String>>,
@@ -142,7 +145,7 @@ pub(crate) struct GroupEntry {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct SortingConfig {
     pub(crate) same_alias: Vec<String>,
     pub(crate) prefer_resolution: PreferResolutionConfig,
@@ -164,14 +167,14 @@ impl Default for SortingConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 #[derive(Default)]
 pub(crate) struct PreferResolutionConfig {
     pub(crate) order: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct TemplateConfig {
     pub(crate) extinf: String,
     pub(crate) url: String,
@@ -189,7 +192,7 @@ impl Default for TemplateConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct AuthConfig {
     pub(crate) token: String,
     pub(crate) protect: Vec<String>,
@@ -209,14 +212,14 @@ impl Default for AuthConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 #[derive(Default)]
 pub(crate) struct ManageConfig {
     pub(crate) enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct XmltvConfig {
     pub(crate) use_alias_name: bool,
 }
@@ -332,4 +335,23 @@ pub(crate) struct ManageTestResult {
     pub(crate) resolution_score: i32,
     pub(crate) resolution_label: String,
     pub(crate) group: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unknown_configuration_fields() {
+        let error = toml::from_str::<Config>(
+            r#"
+                [app]
+                user = "user"
+                unexpected = true
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unexpected"));
+    }
 }
