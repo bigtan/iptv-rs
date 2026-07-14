@@ -12,8 +12,8 @@ tls = ["reqwest/native-tls"]
 rustls = ["reqwest/rustls"]
 
 [dependencies]
-actix-web = { version = "4.13", default-features = false, features = ["cookies", "macros"] }
-anyhow = "1.0.102"
+actix-web = { version = "4.14", default-features = false, features = ["cookies", "macros"] }
+anyhow = "1.0.103"
 async-stream = "0.3"
 chrono = "0.4.45"
 clap = { version = "4.6", features = ["derive"] }
