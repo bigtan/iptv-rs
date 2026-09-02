@@ -38,7 +38,7 @@ jobs:
         with:
           submodules: recursive
       - name: Cross build (release)
-        uses: zijiren233/cargo-cross@v1
+        uses: zijiren233/cargo-cross@v1.5.1
         with:
           command: build
           profile: release
