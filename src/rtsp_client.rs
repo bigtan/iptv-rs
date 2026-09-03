@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use md5::compute as md5_compute;
 use reqwest::Url;
 use std::collections::HashMap;
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,6 +20,27 @@ struct RtspResponse {
     headers: HashMap<String, String>,
     body: Vec<u8>,
 }
+
+#[derive(Debug)]
+pub(crate) struct RtspStatusError {
+    pub(crate) status_code: u16,
+    method: String,
+    uri: String,
+}
+
+impl fmt::Display for RtspStatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "RTSP {} {} failed with {}",
+            self.method,
+            sanitized_uri(&self.uri),
+            self.status_code
+        )
+    }
+}
+
+impl std::error::Error for RtspStatusError {}
 
 #[derive(Clone, Debug)]
 enum AuthKind {
@@ -205,10 +227,10 @@ impl RtspClient {
             .with_context(|| format!("RTSP {method} timed out"))??;
             if response.status_code == 401 {
                 let Some(www_auth) = response.headers.get("www-authenticate").cloned() else {
-                    bail!("RTSP auth required but WWW-Authenticate is missing");
+                    return Err(status_error(method, &current_uri, 401));
                 };
                 let Some(current) = self.auth.clone() else {
-                    bail!("RTSP auth required but URL has no credentials");
+                    return Err(status_error(method, &current_uri, 401));
                 };
 
                 let kind = parse_auth_challenge(&www_auth)?;
@@ -521,8 +543,23 @@ fn ensure_success(method: &str, uri: &str, response: RtspResponse) -> Result<Rts
     if (200..300).contains(&response.status_code) {
         Ok(response)
     } else {
-        bail!("RTSP {method} {uri} failed with {}", response.status_code)
+        Err(status_error(method, uri, response.status_code))
     }
+}
+
+fn status_error(method: &str, uri: &str, status_code: u16) -> anyhow::Error {
+    RtspStatusError {
+        status_code,
+        method: method.to_string(),
+        uri: uri.to_string(),
+    }
+    .into()
+}
+
+pub(crate) fn is_auth_status(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RtspStatusError>()
+        .is_some_and(|error| matches!(error.status_code, 401 | 403))
 }
 
 fn is_redirect_status(status_code: u16) -> bool {

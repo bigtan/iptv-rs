@@ -260,8 +260,30 @@ pub(crate) async fn rtsp_source(
         parsed.host_str().unwrap_or("unknown"),
         parsed.port_or_known_default().unwrap_or(554)
     );
-    let mut client = RtspClient::connect(parsed, if_name).await?;
-    client.describe_and_setup().await?;
+    let mut attempt = 0usize;
+    let mut client = loop {
+        attempt += 1;
+        let error = match RtspClient::connect(parsed.clone(), if_name.clone()).await {
+            Ok(mut candidate) => match candidate.describe_and_setup().await {
+                Ok(()) => break candidate,
+                Err(error) => error,
+            },
+            Err(error) => error,
+        };
+        if attempt >= 3 || !is_transient_rtsp_error(&error) {
+            return Err(error);
+        }
+        let delay = if attempt == 1 {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(3)
+        };
+        warn!(
+            "RTSP setup attempt {attempt}/3 failed with a transient error; retrying in {}s: {error}",
+            delay.as_secs()
+        );
+        tokio::time::sleep(delay).await;
+    };
 
     Ok(stream! {
         let _permit = permit;
@@ -303,6 +325,15 @@ pub(crate) async fn rtsp_source(
             }
         }
         error!("Connection closed");
+    })
+}
+
+fn is_transient_rtsp_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some()
+            || cause
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some()
     })
 }
 

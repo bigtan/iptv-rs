@@ -40,6 +40,9 @@ use args::{Args, EffectiveArgs};
 mod iptv;
 use iptv::{Channel, get_channel_list_raw, get_channels, get_icon};
 
+mod upstream_auth;
+use upstream_auth::{AUTH_REFRESH_INTERVAL, UpstreamAuthManager};
+
 mod fcc;
 mod proxy;
 mod rtsp_client;
@@ -50,6 +53,7 @@ use config::{
     CompiledConfig, Config, ManageTestResult, build_templates, compile_config, load_config,
     should_protect,
 };
+use rtsp_client::is_auth_status as is_rtsp_auth_status;
 use fcc::{FccOptions, parse_fcc_server};
 use shared_proxy::{SharedProxyRecvError, SharedProxyRegistry, SharedProxySubscribeError};
 
@@ -85,6 +89,7 @@ struct AppState {
     upstream_flights: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     icon_flights: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     runtime: RwLock<RuntimeConfig>,
+    upstream_auth: Arc<UpstreamAuthManager>,
 }
 
 struct CachedText {
@@ -574,7 +579,10 @@ async fn get_channels_cached(
     }
 
     let channels = match get_channels(args, need_epg, scheme, host).await {
-        Ok(channels) => channels,
+        Ok(channels) => {
+            state.upstream_auth.mark_success();
+            channels
+        }
         Err(error) => {
             state.upstream_flights.lock().await.remove(&key);
             return Err(error);
@@ -900,14 +908,41 @@ async fn rtsp(
             pairs.append_pair(key, value);
         }
     }
+    if let Err(error) = state.upstream_auth.ensure_fresh(&effective_args).await {
+        warn!("Pre-stream upstream authorization refresh failed: {error}");
+    }
     let permit = match state.shared_proxy.try_acquire() {
         Ok(permit) => permit,
         Err(_) => return HttpResponse::ServiceUnavailable().body("Too many active proxy streams"),
     };
-    match proxy::rtsp_source(target.to_string(), effective_args.interface, permit).await {
+    let target_url = target.to_string();
+    match proxy::rtsp_source(target_url.clone(), effective_args.interface.clone(), permit).await {
         Ok(stream) => HttpResponse::Ok()
             .content_type("video/mp2t")
             .streaming(stream),
+        Err(error) if is_rtsp_auth_status(&error) => {
+            warn!("RTSP authorization rejected; refreshing upstream authorization once");
+            if let Err(refresh_error) = state.upstream_auth.force_refresh(&effective_args).await {
+                return HttpResponse::BadGateway().body(format!(
+                    "RTSP authorization failed and refresh failed: {refresh_error}"
+                ));
+            }
+            let permit = match state.shared_proxy.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return HttpResponse::ServiceUnavailable()
+                        .body("Too many active proxy streams");
+                }
+            };
+            match proxy::rtsp_source(target_url, effective_args.interface, permit).await {
+                Ok(stream) => HttpResponse::Ok()
+                    .content_type("video/mp2t")
+                    .streaming(stream),
+                Err(retry_error) => HttpResponse::BadGateway().body(format!(
+                    "RTSP setup failed after authorization refresh: {retry_error}"
+                )),
+            }
+        }
         Err(e) => HttpResponse::BadGateway().body(format!("RTSP setup failed: {e}")),
     }
 }
@@ -1977,6 +2012,9 @@ async fn udp_like(
         Ok(addr) => addr,
         Err(e) => return HttpResponse::BadRequest().body(format!("Error: {}", e)),
     };
+    if let Err(error) = state.upstream_auth.ensure_fresh(&effective_args).await {
+        warn!("Pre-stream upstream authorization refresh failed: {error}");
+    }
     let fcc = match params.get("fcc") {
         Some(value) => {
             // Read FCC tuning from the live config when a new shared UDP source
@@ -2111,6 +2149,7 @@ async fn main() -> std::io::Result<()> {
         effective_args.fcc_switch_min_unicast_ms
     );
 
+    let upstream_auth = Arc::new(UpstreamAuthManager::default());
     let state = Data::new(AppState {
         cli_args: args.clone(),
         config_path: args.config.clone(),
@@ -2133,12 +2172,50 @@ async fn main() -> std::io::Result<()> {
         icon_cache: AsyncMutex::new(HashMap::new()),
         upstream_flights: AsyncMutex::new(HashMap::new()),
         icon_flights: AsyncMutex::new(HashMap::new()),
+        upstream_auth: upstream_auth.clone(),
         runtime: RwLock::new(RuntimeConfig {
             config,
             compiled,
             templates,
             effective_args: effective_args.clone(),
         }),
+    });
+
+    let periodic_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(AUTH_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first interval tick is immediate. Normal startup traffic performs
+        // the initial login, so wait for the first real six-hour deadline.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let args = match output_effective_args(&periodic_state) {
+                Ok(args) => args,
+                Err(error) => {
+                    warn!("Periodic authorization refresh skipped: {error}");
+                    continue;
+                }
+            };
+            let retry_delays = [
+                Duration::ZERO,
+                Duration::from_secs(60),
+                Duration::from_secs(5 * 60),
+            ];
+            for (attempt, delay) in retry_delays.into_iter().enumerate() {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                match periodic_state.upstream_auth.force_refresh(&args).await {
+                    Ok(()) => break,
+                    Err(error) => warn!(
+                        "Periodic upstream authorization refresh attempt {}/{} failed: {error}",
+                        attempt + 1,
+                        retry_delays.len()
+                    ),
+                }
+            }
+        }
     });
 
     let bind_addr = effective_args.bind.clone();
