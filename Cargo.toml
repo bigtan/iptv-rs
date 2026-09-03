@@ -34,6 +34,7 @@ regex-lite = "0.1"
 reqwest = { version = "0.13", default-features = false, features = [
     "cookies",
     "json",
+    "stream",
 ] }
 rtp-rs = "0.6"
 serde = { version = "1", features = ["derive"] }

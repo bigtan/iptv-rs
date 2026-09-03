@@ -6,26 +6,19 @@ use actix_web::{
 };
 use anyhow::{Result, anyhow};
 use async_stream::stream;
-use chrono::{FixedOffset, Local, TimeZone, Utc};
+use chrono::Local;
 use clap::Parser;
 use log::{debug, warn};
 use reqwest::Client;
 use std::{
     collections::BTreeMap,
     collections::HashMap,
-    io::{BufWriter, Cursor},
     net::SocketAddrV4,
     process::exit,
     str::FromStr,
     sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
-use xml::{
-    EventReader,
-    reader::XmlEvent as XmlReadEvent,
-    writer::{EmitterConfig, XmlEvent as XmlWriteEvent},
-};
-
 use tokio::{sync::Mutex as AsyncMutex, task::JoinSet};
 
 mod auth;
@@ -43,6 +36,15 @@ use iptv::{Channel, get_channel_list_raw, get_channels, get_icon};
 mod upstream_auth;
 use upstream_auth::{AUTH_REFRESH_INTERVAL, UpstreamAuthManager};
 
+mod web_assets;
+use web_assets::BASE_CSS;
+
+mod external_sources;
+use external_sources::{
+    FETCH_TIMEOUT as EXTRA_FETCH_TIMEOUT, fetch_playlists as fetch_extra_playlists,
+    parse_xml as parse_extra_xml,
+};
+
 mod fcc;
 mod proxy;
 mod rtsp_client;
@@ -53,9 +55,20 @@ use config::{
     CompiledConfig, Config, ManageTestResult, build_templates, compile_config, load_config,
     redacted as redacted_config, should_protect,
 };
-use rtsp_client::is_auth_status as is_rtsp_auth_status;
+
+mod xmltv_output;
 use fcc::{FccOptions, parse_fcc_server};
+use rtsp_client::is_auth_status as is_rtsp_auth_status;
 use shared_proxy::{SharedProxyRecvError, SharedProxyRegistry, SharedProxySubscribeError};
+use xmltv_output::{format_time as to_xmltv_time, render as to_xmltv};
+
+mod cache;
+use cache::{
+    CHANNEL_CACHE_TTL, CachedBytes, CachedChannels, CachedText, EPG_CACHE_TTL, ICON_CACHE_TTL,
+    MANAGE_CACHE_TTL, MAX_ICON_CACHE_ENTRIES, MAX_UPSTREAM_CACHE_ENTRIES, PLAYLIST_CACHE_TTL,
+    XMLTV_CACHE_TTL, get_text as get_cached_text, put_stale as put_stale_text,
+    put_text as put_cached_text,
+};
 
 mod playlist;
 use playlist::{
@@ -88,216 +101,8 @@ struct AppState {
     icon_cache: AsyncMutex<HashMap<String, CachedBytes>>,
     upstream_flights: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     icon_flights: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
-    runtime: RwLock<RuntimeConfig>,
     upstream_auth: Arc<UpstreamAuthManager>,
-}
-
-struct CachedText {
-    expires_at: std::time::Instant,
-    body: String,
-}
-
-struct CachedChannels {
-    expires_at: std::time::Instant,
-    channels: Vec<Channel>,
-}
-
-struct CachedBytes {
-    expires_at: std::time::Instant,
-    body: Vec<u8>,
-}
-
-const EXTRA_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-const EXTRA_FETCH_MAX_BYTES: usize = 8 * 1024 * 1024;
-const PLAYLIST_CACHE_TTL: Duration = Duration::from_secs(30);
-const XMLTV_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
-const MANAGE_CACHE_TTL: Duration = Duration::from_secs(30);
-const CHANNEL_CACHE_TTL: Duration = Duration::from_secs(60);
-const EPG_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
-const ICON_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
-const MAX_OUTPUT_CACHE_ENTRIES: usize = 128;
-const MAX_UPSTREAM_CACHE_ENTRIES: usize = 32;
-const MAX_ICON_CACHE_ENTRIES: usize = 512;
-
-fn get_cached_text(cache: &Mutex<HashMap<String, CachedText>>, key: &str) -> Option<String> {
-    let mut cache = cache.lock().ok()?;
-    let cached = cache.get(key)?;
-    if cached.expires_at <= std::time::Instant::now() {
-        cache.remove(key);
-        return None;
-    }
-    Some(cached.body.clone())
-}
-
-fn put_cached_text(
-    cache: &Mutex<HashMap<String, CachedText>>,
-    key: String,
-    body: String,
-    ttl: Duration,
-) {
-    if let Ok(mut cache) = cache.lock() {
-        let now = std::time::Instant::now();
-        cache.retain(|_, cached| cached.expires_at > now);
-        if cache.len() >= MAX_OUTPUT_CACHE_ENTRIES
-            && let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, cached)| cached.expires_at)
-                .map(|(key, _)| key.clone())
-        {
-            cache.remove(&oldest);
-        }
-        cache.insert(
-            key,
-            CachedText {
-                expires_at: now + ttl,
-                body,
-            },
-        );
-    }
-}
-
-fn put_stale_text(cache: &Mutex<HashMap<String, String>>, key: String, body: String) {
-    if let Ok(mut cache) = cache.lock() {
-        if cache.len() >= MAX_OUTPUT_CACHE_ENTRIES
-            && let Some(key) = cache.keys().next().cloned()
-        {
-            cache.remove(&key);
-        }
-        cache.insert(key, body);
-    }
-}
-
-fn to_xmltv_time(unix_time: i64) -> Result<String> {
-    match Utc.timestamp_millis_opt(unix_time) {
-        chrono::LocalResult::Single(t) => Ok(t
-            .with_timezone(&FixedOffset::east_opt(8 * 60 * 60).ok_or(anyhow!(""))?)
-            .format("%Y%m%d%H%M%S")
-            .to_string()),
-        _ => Err(anyhow!("fail to parse time")),
-    }
-}
-
-fn to_xmltv(channels: Vec<Channel>, extra: Vec<EventReader<Cursor<String>>>) -> Result<String> {
-    let mut buf = BufWriter::new(Vec::new());
-    let mut writer = EmitterConfig::new()
-        .perform_indent(false)
-        .create_writer(&mut buf);
-    writer.write(
-        XmlWriteEvent::start_element("tv")
-            .attr("generator-info-name", "iptv-proxy")
-            .attr("source-info-name", "iptv-proxy"),
-    )?;
-    for channel in channels.iter() {
-        writer.write(
-            XmlWriteEvent::start_element("channel").attr("id", &format!("{}", channel.id)),
-        )?;
-        writer.write(XmlWriteEvent::start_element("display-name"))?;
-        writer.write(XmlWriteEvent::characters(&channel.name))?;
-        writer.write(XmlWriteEvent::end_element())?;
-        writer.write(XmlWriteEvent::end_element())?;
-    }
-    // For each extra xml reader, iterate its events and copy allowed tags
-    for reader in extra {
-        for e in reader {
-            match e {
-                Ok(XmlReadEvent::StartElement {
-                    name, attributes, ..
-                }) => {
-                    let name = name.to_string();
-                    let name = name.as_str();
-                    if name != "channel"
-                        && name != "display-name"
-                        && name != "desc"
-                        && name != "title"
-                        && name != "sub-title"
-                        && name != "programme"
-                    {
-                        continue;
-                    }
-                    let name = if name == "title" {
-                        let mut iter = attributes.iter();
-                        loop {
-                            let attr = iter.next();
-                            if attr.is_none() {
-                                break "title";
-                            }
-                            let attr = attr.unwrap();
-                            if attr.name.to_string() == "lang" && attr.value != "chi" {
-                                break "title_extra";
-                            }
-                        }
-                    } else {
-                        name
-                    };
-                    let mut tag = XmlWriteEvent::start_element(name);
-                    for attr in attributes.iter() {
-                        tag = tag.attr(attr.name.borrow(), &attr.value);
-                    }
-                    writer.write(tag)?;
-                }
-                Ok(XmlReadEvent::Characters(content)) => {
-                    writer.write(XmlWriteEvent::characters(&content))?;
-                }
-                Ok(XmlReadEvent::EndElement { name }) => {
-                    let name = name.to_string();
-                    let name = name.as_str();
-                    if name != "channel"
-                        && name != "display-name"
-                        && name != "desc"
-                        && name != "title"
-                        && name != "sub-title"
-                        && name != "programme"
-                    {
-                        continue;
-                    }
-                    writer.write(XmlWriteEvent::end_element())?;
-                }
-                _ => {}
-            }
-        }
-    }
-    for channel in channels.iter() {
-        for epg in channel.epg.iter() {
-            writer.write(
-                XmlWriteEvent::start_element("programme")
-                    .attr("start", &format!("{} +0800", to_xmltv_time(epg.start)?))
-                    .attr("stop", &format!("{} +0800", to_xmltv_time(epg.stop)?))
-                    .attr("channel", &format!("{}", channel.id)),
-            )?;
-            writer.write(XmlWriteEvent::start_element("title").attr("lang", "chi"))?;
-            writer.write(XmlWriteEvent::characters(&epg.title))?;
-            writer.write(XmlWriteEvent::end_element())?;
-            if !epg.desc.is_empty() {
-                writer.write(XmlWriteEvent::start_element("desc"))?;
-                writer.write(XmlWriteEvent::characters(&epg.desc))?;
-                writer.write(XmlWriteEvent::end_element())?;
-            }
-            writer.write(XmlWriteEvent::end_element())?;
-        }
-    }
-    writer.write(XmlWriteEvent::end_element())?;
-    Ok(String::from_utf8(buf.into_inner()?)?)
-}
-
-async fn fetch_extra_text(client: &Client, url: &str) -> Result<String> {
-    let url = reqwest::Url::parse(url)?;
-    let response = client.get(url).send().await?.error_for_status()?;
-    if let Some(len) = response.content_length()
-        && len > EXTRA_FETCH_MAX_BYTES as u64
-    {
-        return Err(anyhow!("Response too large"));
-    }
-    let bytes = response.bytes().await?;
-    if bytes.len() > EXTRA_FETCH_MAX_BYTES {
-        return Err(anyhow!("Response too large"));
-    }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-async fn parse_extra_xml(client: &Client, url: &str) -> Result<EventReader<Cursor<String>>> {
-    let xml = fetch_extra_text(client, url).await?;
-    let reader = Cursor::new(xml);
-    Ok(EventReader::new(reader))
+    runtime: RwLock<RuntimeConfig>,
 }
 
 #[get("/xmltv")]
@@ -389,42 +194,6 @@ async fn xmltv(state: Data<AppState>, req: HttpRequest) -> impl Responder {
             HttpResponse::Ok().content_type("text/xml").body(xml)
         }
     }
-}
-
-async fn parse_extra_playlist(client: &Client, url: &str) -> Result<String> {
-    let response = fetch_extra_text(client, url).await?;
-    if response.starts_with("#EXTM3U") {
-        response
-            .find('\n')
-            .map(|i| response[i..].to_owned()) // include \n
-            .ok_or(anyhow!("Empty playlist"))
-    } else {
-        Err(anyhow!("Playlist does not start with #EXTM3U"))
-    }
-}
-
-async fn fetch_extra_playlists(client: &Client, urls: &[String]) -> Vec<(usize, String)> {
-    let mut set = JoinSet::new();
-    for (index, url) in urls.iter().cloned().enumerate() {
-        let client = client.clone();
-        set.spawn(async move {
-            (
-                index,
-                url.clone(),
-                parse_extra_playlist(&client, &url).await,
-            )
-        });
-    }
-    let mut playlists = Vec::new();
-    while let Some(result) = set.join_next().await {
-        match result {
-            Ok((index, _, Ok(content))) => playlists.push((index, content)),
-            Ok((_, url, Err(error))) => warn!("Failed to parse extra playlist ({url}): {error}"),
-            Err(error) => warn!("Task join error parsing extra playlist: {error}"),
-        }
-    }
-    playlists.sort_by_key(|(index, _)| *index);
-    playlists
 }
 
 #[get("/logo/{id}.png")]
@@ -1037,8 +806,7 @@ async fn manage_index(state: Data<AppState>, req: HttpRequest) -> impl Responder
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Manage Dashboard</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+  <style>{base_css}</style>
   <style>
     :root {{ --bs-body-bg: #f8f9fa; }}
     body {{ background-color: var(--bs-body-bg); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
@@ -1141,6 +909,7 @@ async fn manage_index(state: Data<AppState>, req: HttpRequest) -> impl Responder
         uptime = uptime,
         alias_rules = runtime.config.alias.rules.len(),
         group_count = runtime.config.groups.entries.len(),
+        base_css = BASE_CSS,
     );
     with_auth_cookie(
         &req,
@@ -1607,8 +1376,7 @@ async fn manage_channels_html(
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Channel List - IPTV Proxy</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+  <style>{base_css}</style>
   <style>
     :root {{ --bs-body-bg: #f8f9fa; }}
     body {{ background-color: var(--bs-body-bg); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
@@ -1691,6 +1459,7 @@ async fn manage_channels_html(
         rows = rows,
         count = count,
         limit = limit,
+        base_css = BASE_CSS,
     );
     put_cached_text(
         &state.manage_html_cache,
@@ -1812,8 +1581,7 @@ async fn status(state: Data<AppState>, req: HttpRequest) -> impl Responder {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>IPTV Proxy Status</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+  <style>{base_css}</style>
   <style>
     :root {{ --bs-body-bg: #f8f9fa; }}
     body {{ background-color: var(--bs-body-bg); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
@@ -1947,6 +1715,7 @@ async fn status(state: Data<AppState>, req: HttpRequest) -> impl Responder {
         group_pills = group_pills,
         group_count = group_count,
         channels_link = channels_link,
+        base_css = BASE_CSS,
     );
     let config = match state.runtime.read() {
         Ok(guard) => guard.config.clone(),
@@ -2076,7 +1845,7 @@ async fn rtp(
     udp_like(state, addr, params, req).await
 }
 
-#[actix_web::main] // or #[tokio::main]
+#[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
     let _ = START_TIME.set(std::time::SystemTime::now());

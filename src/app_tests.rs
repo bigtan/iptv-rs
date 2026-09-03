@@ -1,4 +1,7 @@
 use super::*;
+use crate::cache::MAX_OUTPUT_CACHE_ENTRIES;
+use std::io::Cursor;
+use xml::EventReader;
 
 fn cli_args() -> Args {
     Args {
