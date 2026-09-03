@@ -47,7 +47,6 @@ Example file:
 Key sections:
 - `[app]`: login, bind address, proxy switches
 - `[auth]`: token protection, including optional `rtsp`, `udp`, and `logo` protection
-- `[proxy]`: optional RTSP host or `host:port` allow-list
 - `[fcc]`: FCC enablement and timeout tuning
   Uses RTP sequence numbers for multicast switchover, with a minimum unicast play time before switching.
 - `[alias]`: alias rewrite rules
@@ -85,8 +84,15 @@ configured token automatically. The local token is removed before an RTSP
 request is forwarded upstream.
 
 The `/rtsp` and `/udp` routes are available only when their corresponding
-proxy switch is enabled. For deployments outside a trusted LAN, protect these
-endpoints and configure `proxy.allowed_rtsp_hosts`.
+proxy switch is enabled. These proxy endpoints are intended for trusted LANs;
+protect them with an authentication token if they are exposed more broadly.
+
+Successful upstream authorization is refreshed every six hours. Before opening
+a stream, the service also refreshes authorization when the last success is
+older than eight hours. An RTSP 401/403 response triggers one forced refresh and
+one transparent setup retry.
+
+Management pages embed their stylesheet and do not require Internet access.
 
 ## Build
 
