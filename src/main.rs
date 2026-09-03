@@ -51,7 +51,7 @@ mod shared_proxy;
 mod config;
 use config::{
     CompiledConfig, Config, ManageTestResult, build_templates, compile_config, load_config,
-    should_protect,
+    redacted as redacted_config, should_protect,
 };
 use rtsp_client::is_auth_status as is_rtsp_auth_status;
 use fcc::{FccOptions, parse_fcc_server};
@@ -839,7 +839,7 @@ async fn rtsp(
     mut params: Query<BTreeMap<String, String>>,
     req: HttpRequest,
 ) -> impl Responder {
-    let (allowed_hosts, effective_args) = match state.runtime.read() {
+    let effective_args = match state.runtime.read() {
         Ok(guard) => {
             if !guard.effective_args.rtsp_proxy {
                 return HttpResponse::NotFound().body("RTSP proxy disabled");
@@ -847,10 +847,7 @@ async fn rtsp(
             if !check_auth(&req, &guard.config, "rtsp") {
                 return HttpResponse::Unauthorized().body("Unauthorized");
             }
-            (
-                guard.config.proxy.allowed_rtsp_hosts.clone(),
-                guard.effective_args.clone(),
-            )
+            guard.effective_args.clone()
         }
         Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
     };
@@ -890,18 +887,6 @@ async fn rtsp(
         Ok(url) => url,
         Err(e) => return HttpResponse::BadRequest().body(format!("Invalid RTSP target: {e}")),
     };
-    let host = target.host_str().unwrap_or_default();
-    let authority = match target.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
-    };
-    if !allowed_hosts.is_empty()
-        && !allowed_hosts.iter().any(|allowed| {
-            allowed.eq_ignore_ascii_case(host) || allowed.eq_ignore_ascii_case(&authority)
-        })
-    {
-        return HttpResponse::Forbidden().body("RTSP target is not allowed");
-    }
     if !params.is_empty() {
         let mut pairs = target.query_pairs_mut();
         for (key, value) in params.iter() {
@@ -1012,19 +997,7 @@ async fn manage_config(state: Data<AppState>, req: HttpRequest) -> impl Responde
     if !check_auth(&req, &runtime.config, "manage") {
         return HttpResponse::Unauthorized().body("Unauthorized");
     }
-    let mut safe = runtime.config.clone();
-    if safe.app.user.is_some() {
-        safe.app.user = Some("REDACTED".to_string());
-    }
-    if safe.app.passwd.is_some() {
-        safe.app.passwd = Some("REDACTED".to_string());
-    }
-    if safe.app.mac.is_some() {
-        safe.app.mac = Some("REDACTED".to_string());
-    }
-    if !safe.auth.token.is_empty() {
-        safe.auth.token = "REDACTED".to_string();
-    }
+    let safe = redacted_config(&runtime.config);
     match toml::to_string_pretty(&safe) {
         Ok(text) => with_auth_cookie(
             &req,

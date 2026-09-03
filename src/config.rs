@@ -18,16 +18,6 @@ pub(crate) struct Config {
     pub(crate) auth: AuthConfig,
     pub(crate) manage: ManageConfig,
     pub(crate) xmltv: XmltvConfig,
-    pub(crate) proxy: ProxyConfig,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct ProxyConfig {
-    /// Optional RTSP host allow-list. An empty list keeps backward-compatible
-    /// authenticated access; deployments exposed beyond a trusted LAN should
-    /// configure it explicitly.
-    pub(crate) allowed_rtsp_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -328,6 +318,24 @@ pub(crate) fn should_protect(config: &Config, endpoint: &str) -> bool {
         .any(|e| e.eq_ignore_ascii_case(endpoint))
 }
 
+pub(crate) fn redacted(config: &Config) -> Config {
+    let mut safe = config.clone();
+    for value in [
+        &mut safe.app.user,
+        &mut safe.app.passwd,
+        &mut safe.app.mac,
+        &mut safe.app.imei,
+    ] {
+        if value.is_some() {
+            *value = Some("REDACTED".to_string());
+        }
+    }
+    if !safe.auth.token.is_empty() {
+        safe.auth.token = "REDACTED".to_string();
+    }
+    safe
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ManageTestResult {
     pub(crate) input: String,
@@ -353,5 +361,22 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("unexpected"));
+    }
+
+    #[test]
+    fn redacts_every_upstream_identity_field() {
+        let mut config = Config::default();
+        config.app.user = Some("user".to_string());
+        config.app.passwd = Some("password".to_string());
+        config.app.mac = Some("mac".to_string());
+        config.app.imei = Some("imei".to_string());
+        config.auth.token = "token".to_string();
+
+        let safe = redacted(&config);
+        assert_eq!(safe.app.user.as_deref(), Some("REDACTED"));
+        assert_eq!(safe.app.passwd.as_deref(), Some("REDACTED"));
+        assert_eq!(safe.app.mac.as_deref(), Some("REDACTED"));
+        assert_eq!(safe.app.imei.as_deref(), Some("REDACTED"));
+        assert_eq!(safe.auth.token, "REDACTED");
     }
 }
