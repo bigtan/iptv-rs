@@ -8,7 +8,7 @@ use anyhow::{Result, anyhow};
 use async_stream::stream;
 use chrono::Local;
 use clap::Parser;
-use log::{debug, warn};
+use log::{debug, error, warn};
 use reqwest::Client;
 use std::{
     collections::BTreeMap,
@@ -547,18 +547,33 @@ pub async fn run() -> std::io::Result<()> {
                 Duration::from_secs(60),
                 Duration::from_secs(5 * 60),
             ];
+            let mut last_error = None;
             for (attempt, delay) in retry_delays.into_iter().enumerate() {
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
                 match periodic_state.upstream_auth.force_refresh(&args).await {
-                    Ok(()) => break,
-                    Err(error) => warn!(
-                        "Periodic upstream authorization refresh attempt {}/{} failed: {error}",
-                        attempt + 1,
-                        retry_delays.len()
-                    ),
+                    Ok(()) => {
+                        last_error = None;
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(
+                            "Periodic upstream authorization refresh attempt {}/{} failed: {error}",
+                            attempt + 1,
+                            retry_delays.len()
+                        );
+                        last_error = Some(error);
+                    }
                 }
+            }
+            if let Some(error) = last_error {
+                error!(
+                    "Periodic upstream authorization refresh exhausted all {} attempts; \
+                     the next scheduled refresh is in {:?}: {error}",
+                    retry_delays.len(),
+                    AUTH_REFRESH_INTERVAL
+                );
             }
         }
     });
