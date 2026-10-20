@@ -1,5 +1,7 @@
 # iptv-rs
 
+English | [简体中文](README.md)
+
 `iptv-rs` is an independently maintained IPTV proxy written in Rust.
 
 It provides:
