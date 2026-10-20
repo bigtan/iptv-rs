@@ -120,25 +120,41 @@ TLS feature selection:
 - `--no-default-features --features tls` for native TLS/OpenSSL
 - `--no-default-features` for an HTTP-only minimal build
 
-## Service Example
+## OpenWrt Integration
+
+This repository provides native OpenWrt package definitions under [openwrt/](openwrt):
+
+- `iptv`: Daemon package containing prebuilt musl release binaries, a procd init script, and default UCI configuration.
+- `luci-app-iptv`: Modern LuCI Web UI application for graphical configuration.
+
+### Service Management and UCI Configuration
+
+Service lifecycle is managed by OpenWrt's `procd`. Configuration is stored in `/etc/config/iptv`. Upon starting, the init script renders UCI settings into `/var/etc/iptv.toml` before launching the daemon.
+
+Common service commands:
 
 ```sh
-#!/bin/sh /etc/rc.common
+# Enable at startup and start the service
+/etc/init.d/iptv enable
+/etc/init.d/iptv start
 
-START=99
-STOP=99
-
-INTERFACE=pppoe-iptv
-BIND=0.0.0.0:7878
-
-start() {
-    ( RUST_LOG=info /usr/bin/iptv-rs -c /etc/iptv/iptv.toml -b $BIND -I $INTERFACE --udp-proxy --rtsp-proxy 2>&1 & echo $! >&3 ) 3>/var/run/iptv-rs.pid | logger -t "iptv-rs" &
-}
-
-stop() {
-    if [ -f /var/run/iptv-rs.pid ]; then
-        kill -9 "$(cat /var/run/iptv-rs.pid)" 2>/dev/null
-        rm -f /var/run/iptv-rs.pid
-    fi
-}
+# Check status or reload configuration
+/etc/init.d/iptv status
+/etc/init.d/iptv reload
 ```
+
+Example configuration via UCI CLI:
+
+```sh
+uci set iptv.main.enabled='1'
+uci set iptv.main.user='YOUR_USER'
+uci set iptv.main.passwd='YOUR_PASSWORD'
+uci set iptv.main.mac='YOUR_MAC'
+uci set iptv.main.interface='pppoe-iptv'
+uci commit iptv
+/etc/init.d/iptv restart
+```
+
+### Building and Feed Integration
+
+Package directories can be copied into an OpenWrt source tree or SDK for compilation, or built via GitHub Actions workflows. See [openwrt/README.md](openwrt/README.md) for full build instructions and feed details.

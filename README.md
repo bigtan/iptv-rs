@@ -112,25 +112,41 @@ TLS 特性选择：
 - `--no-default-features --features tls` 使用系统原生 TLS / OpenSSL
 - `--no-default-features` 构建仅支持 HTTP 的极简版本
 
-## 服务示例
+## OpenWrt 支持
+
+本项目提供了面向 OpenWrt 的完整集成支持，定义文件位于 [openwrt/](openwrt) 目录：
+
+- `iptv`：核心守护进程包，包含预编译 musl 静态二进制程序、procd init 服务脚本及 UCI 默认配置文件。
+- `luci-app-iptv`：原生的 LuCI Web 图形管理界面。
+
+### 服务管理与 UCI 配置
+
+服务生命周期由 OpenWrt 的 `procd` 进行托管，配置项保存在 `/etc/config/iptv`。服务启动时，init 脚本会自动将 UCI 配置转换为 `/var/etc/iptv.toml` 并拉起进程。
+
+基本服务管理命令：
 
 ```sh
-#!/bin/sh /etc/rc.common
+# 启用开机自启并启动服务
+/etc/init.d/iptv enable
+/etc/init.d/iptv start
 
-START=99
-STOP=99
-
-INTERFACE=pppoe-iptv
-BIND=0.0.0.0:7878
-
-start() {
-    ( RUST_LOG=info /usr/bin/iptv-rs -c /etc/iptv/iptv.toml -b $BIND -I $INTERFACE --udp-proxy --rtsp-proxy 2>&1 & echo $! >&3 ) 3>/var/run/iptv-rs.pid | logger -t "iptv-rs" &
-}
-
-stop() {
-    if [ -f /var/run/iptv-rs.pid ]; then
-        kill -9 "$(cat /var/run/iptv-rs.pid)" 2>/dev/null
-        rm -f /var/run/iptv-rs.pid
-    fi
-}
+# 检查运行状态或重新加载配置
+/etc/init.d/iptv status
+/etc/init.d/iptv reload
 ```
+
+通过 UCI 命令行配置示例：
+
+```sh
+uci set iptv.main.enabled='1'
+uci set iptv.main.user='YOUR_USER'
+uci set iptv.main.passwd='YOUR_PASSWORD'
+uci set iptv.main.mac='YOUR_MAC'
+uci set iptv.main.interface='pppoe-iptv'
+uci commit iptv
+/etc/init.d/iptv restart
+```
+
+### 编译与固件构建
+
+可将项目中的 package 目录复制到 OpenWrt 源码树或 SDK 中进行编译，亦可通过 GitHub Actions 自动化构建固件。详细构建步骤与配置参见 [openwrt/README.md](openwrt/README.md)。
