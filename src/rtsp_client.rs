@@ -8,10 +8,13 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::time::timeout;
-use tokio_util::bytes::Bytes;
+use tokio_util::bytes::{Buf, Bytes, BytesMut};
 
 const RTSP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RTSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const RTSP_TEARDOWN_TIMEOUT: Duration = Duration::from_millis(500);
+const RTSP_TCP_RECV_BUFFER: u32 = 2 * 1024 * 1024;
+const RTSP_READ_BUF_CAPACITY: usize = 64 * 1024;
 const MAX_RTSP_HEADER: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
@@ -66,9 +69,8 @@ struct AuthState {
 }
 
 pub(crate) struct RtspClient {
-    stream: TcpStream,
-    read_buf: Vec<u8>,
-    read_pos: usize,
+    stream: Option<TcpStream>,
+    read_buf: BytesMut,
     cseq: u32,
     session: Option<String>,
     auth: Option<AuthState>,
@@ -76,6 +78,7 @@ pub(crate) struct RtspClient {
     bind_hint: Option<String>,
     keepalive_uri: String,
     keepalive_method: KeepaliveMethod,
+    teardown_uri: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -88,10 +91,13 @@ enum KeepaliveMethod {
 impl RtspClient {
     pub(crate) async fn connect(url: Url, if_name: Option<String>) -> Result<Self> {
         let stream = connect_tcp(&url, if_name.clone()).await?;
-        Ok(Self {
-            stream,
-            read_buf: Vec::with_capacity(8192),
-            read_pos: 0,
+        Ok(Self::from_stream(stream, url, if_name))
+    }
+
+    fn from_stream(stream: TcpStream, url: Url, if_name: Option<String>) -> Self {
+        Self {
+            stream: Some(stream),
+            read_buf: BytesMut::with_capacity(RTSP_READ_BUF_CAPACITY),
             cseq: 1,
             session: None,
             auth: auth_from_url(&url),
@@ -99,7 +105,14 @@ impl RtspClient {
             bind_hint: if_name,
             keepalive_uri: "*".to_string(),
             keepalive_method: KeepaliveMethod::Options,
-        })
+            teardown_uri: None,
+        }
+    }
+
+    fn stream_mut(&mut self) -> Result<&mut TcpStream> {
+        self.stream
+            .as_mut()
+            .ok_or_else(|| anyhow!("RTSP connection already closed"))
     }
 
     pub(crate) async fn describe_and_setup(&mut self) -> Result<()> {
@@ -130,6 +143,7 @@ impl RtspClient {
             presentation.control, presentation.tracks
         );
 
+        self.teardown_uri = Some(presentation.control.clone());
         for (index, track) in presentation.tracks.iter().enumerate() {
             let interleaved = format!(
                 "RTP/AVP/TCP;unicast;interleaved={}-{}",
@@ -152,18 +166,13 @@ impl RtspClient {
 
     pub(crate) async fn read_next_message(&mut self) -> Result<RtspMessage> {
         self.ensure_buffered(1).await?;
-        if self.read_buf[self.read_pos] == b'$' {
+        if self.read_buf[0] == b'$' {
             self.ensure_buffered(4).await?;
-            let channel = self.read_buf[self.read_pos + 1];
-            let len = u16::from_be_bytes([
-                self.read_buf[self.read_pos + 2],
-                self.read_buf[self.read_pos + 3],
-            ]) as usize;
+            let channel = self.read_buf[1];
+            let len = u16::from_be_bytes([self.read_buf[2], self.read_buf[3]]) as usize;
             self.ensure_buffered(4 + len).await?;
-            let start = self.read_pos + 4;
-            let end = start + len;
-            let payload = Bytes::copy_from_slice(&self.read_buf[start..end]);
-            self.consume(end - self.read_pos);
+            self.read_buf.advance(4);
+            let payload = self.read_buf.split_to(len).freeze();
             Ok(RtspMessage::Interleaved { channel, payload })
         } else {
             self.read_response().await.map(|_| RtspMessage::Response)
@@ -279,14 +288,14 @@ impl RtspClient {
             sanitized_url(&redirected)
         );
         let stream = connect_tcp(&redirected, self.bind_hint.clone()).await?;
-        self.stream = stream;
+        self.stream = Some(stream);
         self.read_buf.clear();
-        self.read_pos = 0;
         self.cseq = 1;
         self.session = None;
         self.request_url = redirected;
         self.keepalive_uri = "*".to_string();
         self.keepalive_method = KeepaliveMethod::Options;
+        self.teardown_uri = None;
         if origin_changed || !self.request_url.username().is_empty() {
             self.auth = auth_from_url(&self.request_url);
         }
@@ -321,11 +330,14 @@ impl RtspClient {
         }
         req.push_str("\r\n");
 
-        self.stream.write_all(req.as_bytes()).await?;
-        if !body.is_empty() {
-            self.stream.write_all(body).await?;
+        {
+            let stream = self.stream_mut()?;
+            stream.write_all(req.as_bytes()).await?;
+            if !body.is_empty() {
+                stream.write_all(body).await?;
+            }
+            stream.flush().await?;
         }
-        self.stream.flush().await?;
         log::info!(target: "iptv::proxy", "RTSP {} {}", method, sanitized_uri(uri));
 
         let response = self.read_response().await?;
@@ -355,14 +367,17 @@ impl RtspClient {
     }
 
     async fn ensure_buffered(&mut self, needed: usize) -> Result<()> {
-        while self.read_buf.len().saturating_sub(self.read_pos) < needed {
-            self.compact_if_needed();
-            let mut tmp = [0u8; 8192];
-            let n = self.stream.read(&mut tmp).await?;
+        while self.read_buf.len() < needed {
+            let additional = needed.saturating_sub(self.read_buf.len()).max(8192);
+            self.read_buf.reserve(additional);
+            let stream = self
+                .stream
+                .as_mut()
+                .ok_or_else(|| anyhow!("RTSP connection already closed"))?;
+            let n = stream.read_buf(&mut self.read_buf).await?;
             if n == 0 {
                 bail!("RTSP connection closed");
             }
-            self.read_buf.extend_from_slice(&tmp[..n]);
         }
         Ok(())
     }
@@ -370,31 +385,28 @@ impl RtspClient {
     async fn read_response(&mut self) -> Result<RtspResponse> {
         let header_end = loop {
             self.ensure_buffered(1).await?;
-            if self.read_buf[self.read_pos] == b'$' {
+            if self.read_buf[0] == b'$' {
                 self.ensure_buffered(4).await?;
-                let len = u16::from_be_bytes([
-                    self.read_buf[self.read_pos + 2],
-                    self.read_buf[self.read_pos + 3],
-                ]) as usize;
+                let len = u16::from_be_bytes([self.read_buf[2], self.read_buf[3]]) as usize;
                 self.ensure_buffered(4 + len).await?;
                 log::warn!(
                     target: "iptv::proxy",
                     "RTSP ignoring interleaved data while awaiting RTSP response"
                 );
-                self.consume(4 + len);
+                self.read_buf.advance(4 + len);
                 continue;
             }
-            if let Some(pos) = find_double_crlf(&self.read_buf[self.read_pos..]) {
+            if let Some(pos) = find_double_crlf(&self.read_buf) {
                 break pos;
             }
-            if self.read_buf.len().saturating_sub(self.read_pos) >= MAX_RTSP_HEADER {
+            if self.read_buf.len() >= MAX_RTSP_HEADER {
                 bail!("RTSP response header exceeds {MAX_RTSP_HEADER} bytes");
             }
-            self.ensure_buffered(self.read_buf.len().saturating_sub(self.read_pos) + 1)
-                .await?;
+            let next_needed = self.read_buf.len() + 1;
+            self.ensure_buffered(next_needed).await?;
         };
 
-        let header_bytes = &self.read_buf[self.read_pos..self.read_pos + header_end];
+        let header_bytes = &self.read_buf[..header_end];
         let header_text = String::from_utf8_lossy(header_bytes);
         let mut lines = header_text.split("\r\n");
         let status_line = lines
@@ -429,10 +441,12 @@ impl RtspClient {
         }
         let total_len = header_end + 4 + content_len;
         self.ensure_buffered(total_len).await?;
-        let body_start = self.read_pos + header_end + 4;
-        let body_end = self.read_pos + total_len;
-        let body = self.read_buf[body_start..body_end].to_vec();
-        self.consume(total_len);
+        self.read_buf.advance(header_end + 4);
+        let body = if content_len == 0 {
+            Vec::new()
+        } else {
+            self.read_buf.split_to(content_len).to_vec()
+        };
 
         Ok(RtspResponse {
             status_code,
@@ -440,29 +454,70 @@ impl RtspClient {
             body,
         })
     }
+}
 
-    fn consume(&mut self, amount: usize) {
-        self.read_pos += amount;
-        self.compact_if_needed();
-    }
+impl Drop for RtspClient {
+    fn drop(&mut self) {
+        let (Some(session), Some(mut stream)) = (self.session.take(), self.stream.take()) else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
 
-    fn compact_if_needed(&mut self) {
-        if self.read_pos == 0 {
-            return;
-        }
-        if self.read_pos >= self.read_buf.len() {
-            self.read_buf.clear();
-            self.read_pos = 0;
-            return;
-        }
-        if self.read_pos >= 8192 || self.read_pos * 2 >= self.read_buf.len() {
-            self.read_buf.copy_within(self.read_pos.., 0);
-            self.read_buf.truncate(self.read_buf.len() - self.read_pos);
-            self.read_pos = 0;
-        }
+        let uri = self
+            .teardown_uri
+            .take()
+            .unwrap_or_else(|| self.request_url.to_string());
+        let cseq = self.cseq;
+        self.cseq += 1;
+        let req = build_teardown_request(&uri, cseq, &session, self.auth.as_mut());
+        let safe_uri = sanitized_uri(&uri);
+
+        handle.spawn(async move {
+            let _ = timeout(RTSP_TEARDOWN_TIMEOUT, async move {
+                if stream.write_all(req.as_bytes()).await.is_ok() {
+                    let _ = stream.flush().await;
+                    let _ = stream.shutdown().await;
+                    let mut discard = [0u8; 1024];
+                    let mut drained = 0usize;
+                    while drained < 256 * 1024 {
+                        match stream.read(&mut discard).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => drained += n,
+                        }
+                    }
+                }
+            })
+            .await;
+            log::debug!(
+                target: "iptv::proxy",
+                "RTSP best-effort TEARDOWN completed for {}",
+                safe_uri
+            );
+        });
     }
 }
 
+fn build_teardown_request(
+    uri: &str,
+    cseq: u32,
+    session: &str,
+    auth: Option<&mut AuthState>,
+) -> String {
+    let mut req = format!(
+        "TEARDOWN {uri} RTSP/1.0\r\nCSeq: {cseq}\r\nUser-Agent: rust-iptv-proxy\r\nSession: {session}\r\n"
+    );
+    if let Some(auth) = auth
+        && let Ok(value) = build_auth_header(auth, "TEARDOWN", uri)
+    {
+        req.push_str(&format!("Authorization: {value}\r\n"));
+    }
+    req.push_str("\r\n");
+    req
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum RtspMessage {
     Response,
     Interleaved { channel: u8, payload: Bytes },
@@ -479,6 +534,12 @@ async fn connect_tcp(url: &Url, if_name: Option<String>) -> Result<TcpStream> {
             SocketAddr::V4(_) => TcpSocket::new_v4()?,
             SocketAddr::V6(_) => TcpSocket::new_v6()?,
         };
+        if let Err(err) = socket.set_nodelay(true) {
+            log::warn!(target: "iptv::proxy", "failed to set RTSP TCP_NODELAY: {err}");
+        }
+        if let Err(err) = socket.set_recv_buffer_size(RTSP_TCP_RECV_BUFFER) {
+            log::warn!(target: "iptv::proxy", "failed to set RTSP TCP receive buffer: {err}");
+        }
         match &bind_target {
             Some(BindTarget::Ip(local_ip)) if local_ip.is_ipv4() == addr.is_ipv4() => {
                 let bind_addr = SocketAddr::new(*local_ip, 0);
@@ -735,10 +796,7 @@ fn build_auth_header(auth: &mut AuthState, method: &str, uri: &str) -> Result<St
         AuthKind::Digest(challenge) => {
             auth.nonce_count += 1;
             let nc = format!("{:08x}", auth.nonce_count);
-            let cnonce = format!(
-                "{:x}",
-                md5_compute(format!("{method}:{uri}:{nc}:{}", auth.username))
-            );
+            let cnonce = format!("{:016x}", rand::random::<u64>());
             let qop = challenge
                 .qop
                 .as_deref()
@@ -879,6 +937,7 @@ fn log_play_response(headers: &HashMap<String, String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
 
     #[test]
     fn digest_without_qop_uses_legacy_response_shape() {
@@ -898,6 +957,35 @@ mod tests {
         let header = build_auth_header(&mut auth, "DESCRIBE", "rtsp://host/live").unwrap();
         assert!(!header.contains("qop="));
         assert!(!header.contains("cnonce="));
+    }
+
+    #[test]
+    fn digest_with_qop_generates_random_hex_cnonce() {
+        let mut auth = AuthState {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            kind: AuthKind::Digest(DigestChallenge {
+                realm: "realm".to_string(),
+                nonce: "nonce".to_string(),
+                opaque: Some("op".to_string()),
+                algorithm: Some("MD5".to_string()),
+                qop: Some("auth".to_string()),
+            }),
+            nonce_count: 0,
+        };
+
+        let h1 = build_auth_header(&mut auth, "SETUP", "rtsp://host/live").unwrap();
+        let h2 = build_auth_header(&mut auth, "PLAY", "rtsp://host/live").unwrap();
+        let params1 = parse_auth_params(h1.strip_prefix("Digest ").unwrap());
+        let params2 = parse_auth_params(h2.strip_prefix("Digest ").unwrap());
+
+        let cnonce1 = params1.get("cnonce").expect("missing cnonce");
+        let cnonce2 = params2.get("cnonce").expect("missing cnonce");
+        assert_eq!(cnonce1.len(), 16);
+        assert!(cnonce1.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(cnonce1, cnonce2);
+        assert_eq!(params1.get("nc").map(String::as_str), Some("00000001"));
+        assert_eq!(params2.get("nc").map(String::as_str), Some("00000002"));
     }
 
     #[test]
@@ -941,5 +1029,88 @@ mod tests {
         };
 
         assert!(build_auth_header(&mut auth, "PLAY", "rtsp://host/live").is_err());
+    }
+
+    #[actix_web::test]
+    async fn bytes_mut_parses_fragmented_interleaved_and_response_messages() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let writer = tokio::spawn(async move {
+            let (mut server, _) = listener.accept().await.unwrap();
+            server.write_all(&[b'$', 0, 0]).await.unwrap();
+            server.write_all(&[5, b'h', b'e']).await.unwrap();
+            server
+                .write_all(b"lloRTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Length: 2\r\n\r\nOK")
+                .await
+                .unwrap();
+            server.write_all(&[b'$', 1, 0, 3, 1, 2, 3]).await.unwrap();
+            server.flush().await.unwrap();
+        });
+
+        let url = Url::parse(&format!("rtsp://{addr}/live")).unwrap();
+        let mut client = RtspClient::connect(url, None).await.unwrap();
+
+        assert_eq!(
+            client.read_next_message().await.unwrap(),
+            RtspMessage::Interleaved {
+                channel: 0,
+                payload: Bytes::from_static(b"hello"),
+            }
+        );
+        assert_eq!(
+            client.read_next_message().await.unwrap(),
+            RtspMessage::Response
+        );
+        assert_eq!(
+            client.read_next_message().await.unwrap(),
+            RtspMessage::Interleaved {
+                channel: 1,
+                payload: Bytes::from_static(&[1, 2, 3]),
+            }
+        );
+        writer.await.unwrap();
+    }
+
+    #[actix_web::test]
+    async fn drop_sends_best_effort_teardown_with_session_and_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut server, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = server.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.extend_from_slice(&tmp[..n]);
+                if find_double_crlf(&received).is_some() {
+                    let _ = server
+                        .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 4\r\n\r\n")
+                        .await;
+                    break;
+                }
+            }
+            String::from_utf8(received).unwrap()
+        });
+
+        let url = Url::parse(&format!("rtsp://alice:secret@{addr}/live/ch1")).unwrap();
+        let mut client = RtspClient::connect(url, None).await.unwrap();
+        client.cseq = 4;
+        client.session = Some("sess-42".to_string());
+        client.teardown_uri = Some(format!("rtsp://{addr}/live/ch1"));
+        drop(client);
+
+        let raw_teardown = timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("server should receive TEARDOWN promptly")
+            .unwrap();
+        assert!(raw_teardown.starts_with(&format!("TEARDOWN rtsp://{addr}/live/ch1 RTSP/1.0\r\n")));
+        assert!(raw_teardown.contains("CSeq: 4\r\n"));
+        assert!(raw_teardown.contains("Session: sess-42\r\n"));
+        assert!(raw_teardown.contains("Authorization: Basic "));
     }
 }

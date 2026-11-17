@@ -15,7 +15,7 @@ pub(crate) struct FccOptions {
     pub(crate) switch_min_unicast_ms: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TelecomResponse {
     Ignore,
     JoinMulticast,
@@ -29,7 +29,7 @@ pub(crate) enum TelecomResponse {
     Sync,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TelecomResponseMeta {
     pub(crate) fmt: u8,
     pub(crate) result_code: Option<u8>,
@@ -237,11 +237,57 @@ mod tests {
             SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 12000),
         )
         .unwrap();
-        match response {
-            TelecomResponse::Redirect { server } => {
-                assert_eq!(server, SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 15970));
+        assert_eq!(
+            response,
+            TelecomResponse::Redirect {
+                server: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 15970)
             }
-            other => panic!("unexpected response: {other:?}"),
-        }
+        );
+    }
+
+    #[test]
+    fn telecom_response_same_ip_port_redirect_preserves_host_with_new_port() {
+        let current = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8027);
+
+        let mut unspecified_ip_packet = [0u8; 36];
+        unspecified_ip_packet[0] = 0x80 | FCC_FMT_TELECOM_RESP;
+        unspecified_ip_packet[1] = RTCP_PAYLOAD_TYPE_RTPFB;
+        unspecified_ip_packet[12] = 0;
+        unspecified_ip_packet[13] = 3;
+        unspecified_ip_packet[14..16].copy_from_slice(&15970u16.to_be_bytes());
+
+        let (resp_zero_ip, meta_zero_ip) =
+            parse_telecom_response_with_meta(&unspecified_ip_packet, current).unwrap();
+        assert_eq!(
+            resp_zero_ip,
+            TelecomResponse::Redirect {
+                server: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 15970)
+            }
+        );
+        assert_eq!(meta_zero_ip.signal_port, Some(15970));
+        assert_eq!(meta_zero_ip.server_ip, Some(Ipv4Addr::new(10, 0, 0, 1)));
+
+        let mut same_ip_packet = unspecified_ip_packet;
+        same_ip_packet[20..24].copy_from_slice(&[10, 0, 0, 1]);
+        let (resp_same_ip, _) = parse_telecom_response_with_meta(&same_ip_packet, current).unwrap();
+        assert_eq!(
+            resp_same_ip,
+            TelecomResponse::Redirect {
+                server: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 15970)
+            }
+        );
+    }
+
+    #[test]
+    fn telecom_termination_sets_stop_bit_when_seqn_zero() {
+        let addr = SocketAddrV4::new(Ipv4Addr::new(239, 1, 2, 3), 5140);
+        let immediate = build_telecom_termination(addr, 0);
+        assert_eq!(immediate[0] & 0x1f, FCC_FMT_TELECOM_TERM);
+        assert_eq!(immediate[12], 1);
+        assert_eq!(u16::from_be_bytes([immediate[14], immediate[15]]), 0);
+
+        let with_seq = build_telecom_termination(addr, 1234);
+        assert_eq!(with_seq[12], 0);
+        assert_eq!(u16::from_be_bytes([with_seq[14], with_seq[15]]), 1234);
     }
 }
