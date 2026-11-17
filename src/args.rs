@@ -1,6 +1,6 @@
 use clap::Parser;
 
-#[derive(Parser, Clone)]
+#[derive(Parser, Clone, Debug)]
 #[command(name = "iptv-rs")]
 pub(crate) struct Args {
     #[arg(short = 'u', long)]
@@ -18,6 +18,12 @@ pub(crate) struct Args {
     #[arg(short = 'b', long)]
     pub(crate) bind: Option<String>,
 
+    #[arg(long)]
+    pub(crate) bind_interface: Option<String>,
+
+    #[arg(long)]
+    pub(crate) workers: Option<usize>,
+
     #[arg(short = 'a', long)]
     pub(crate) address: Option<String>,
 
@@ -27,12 +33,6 @@ pub(crate) struct Args {
     #[arg(short = 'c', long)]
     pub(crate) config: Option<String>,
 
-    #[arg(long)]
-    pub(crate) extra_playlist: Vec<String>,
-
-    #[arg(long)]
-    pub(crate) extra_xmltv: Vec<String>,
-
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub(crate) udp_proxy: bool,
 
@@ -40,17 +40,22 @@ pub(crate) struct Args {
     pub(crate) rtsp_proxy: bool,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct EffectiveArgs {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UpstreamCredentials {
     pub(crate) user: String,
     pub(crate) passwd: String,
     pub(crate) mac: String,
     pub(crate) imei: String,
-    pub(crate) bind: String,
     pub(crate) address: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EffectiveArgs {
+    pub(crate) upstream: Option<UpstreamCredentials>,
+    pub(crate) bind: String,
+    pub(crate) bind_interface: Option<String>,
+    pub(crate) workers: Option<usize>,
     pub(crate) interface: Option<String>,
-    pub(crate) extra_playlist: Vec<String>,
-    pub(crate) extra_xmltv: Vec<String>,
     pub(crate) udp_proxy: bool,
     pub(crate) rtsp_proxy: bool,
     pub(crate) fcc_enabled: bool,

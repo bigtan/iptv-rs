@@ -5,12 +5,6 @@ version = "0.3.6"
 license = "AGPL-3.0-only"
 description = "Independent Rust IPTV proxy with native RTSP replay and multicast proxy support"
 
-[features]
-default = ["rustls"]
-http2 = ["reqwest/http2"]
-tls = ["reqwest/native-tls"]
-rustls = ["reqwest/rustls"]
-
 [dependencies]
 actix-web = { version = "4.15", default-features = false, features = ["cookies", "macros"] }
 anyhow = "1.0.104"
@@ -34,16 +28,14 @@ regex-lite = "0.1"
 reqwest = { version = "0.13", default-features = false, features = [
     "cookies",
     "json",
-    "stream",
 ] }
 rtp-rs = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = "0.6"
-tokio = { version = "1", features = ["macros"] }
+tokio = { version = "1", features = ["macros", "signal"] }
 tokio-util = { version = "0.7.19", features = ["codec", "net"] }
 toml = "1.1"
-xml-rs = "1.0.0"
 
 [profile.release]
 opt-level = 3

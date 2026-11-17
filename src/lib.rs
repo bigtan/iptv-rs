@@ -1,25 +1,16 @@
-use actix_web::{
-    App, HttpRequest, HttpResponse, HttpServer, Responder, get,
-    http::header,
-    post,
-    web::{Bytes, Data, Path, Query},
-};
+use actix_web::{App, HttpServer, web::Data};
 use anyhow::{Result, anyhow};
-use async_stream::stream;
-use chrono::Local;
 use clap::Parser;
-use log::{debug, error, warn};
-use reqwest::Client;
+use log::{debug, error, info, warn};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::BTreeMap,
-    collections::HashMap,
-    net::SocketAddrV4,
+    fmt,
+    net::{SocketAddr, TcpListener, ToSocketAddrs},
     process::exit,
-    str::FromStr,
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{Arc, OnceLock, RwLock},
     time::Duration,
 };
-use tokio::{sync::Mutex as AsyncMutex, task::JoinSet};
 
 mod auth;
 use auth::{check_auth, with_auth_cookie};
@@ -28,7 +19,7 @@ use auth::{check_auth, with_auth_cookie};
 mod app_tests;
 
 mod args;
-use args::{Args, EffectiveArgs};
+use args::{Args, EffectiveArgs, UpstreamCredentials};
 
 mod iptv;
 use iptv::{Channel, get_channel_list_raw, get_channels, get_icon};
@@ -38,12 +29,6 @@ use upstream_auth::{AUTH_REFRESH_INTERVAL, UpstreamAuthManager};
 
 mod web_assets;
 use web_assets::BASE_CSS;
-
-mod external_sources;
-use external_sources::{
-    FETCH_TIMEOUT as EXTRA_FETCH_TIMEOUT, fetch_playlists as fetch_extra_playlists,
-    parse_xml as parse_extra_xml,
-};
 
 mod fcc;
 mod proxy;
@@ -57,52 +42,39 @@ use config::{
 };
 
 mod xmltv_output;
-use fcc::{FccOptions, parse_fcc_server};
-use rtsp_client::is_auth_status as is_rtsp_auth_status;
-use shared_proxy::{SharedProxyRecvError, SharedProxyRegistry, SharedProxySubscribeError};
-use xmltv_output::{format_time as to_xmltv_time, render as to_xmltv};
+use shared_proxy::SharedProxyRegistry;
 
 mod cache;
-use cache::{
-    CHANNEL_CACHE_TTL, CachedBytes, CachedChannels, CachedText, EPG_CACHE_TTL, ICON_CACHE_TTL,
-    MANAGE_CACHE_TTL, MAX_ICON_CACHE_ENTRIES, MAX_UPSTREAM_CACHE_ENTRIES, PLAYLIST_CACHE_TTL,
-    XMLTV_CACHE_TTL, get_text as get_cached_text, put_stale as put_stale_text,
-    put_text as put_cached_text,
-};
+use cache::{CHANNEL_CACHE_TTL, CacheStore, EPG_CACHE_TTL};
 
 mod playlist;
-use playlist::{
-    ChannelEntry, EntryBuildContext, add_alias_and_resolution_for_name, apply_alias,
-    finalize_entries, parse_m3u_playlist, render_playlist, resolve_group_for_alias,
-};
+use playlist::{ChannelEntry, apply_alias};
 
-static START_TIME: OnceLock<std::time::SystemTime> = OnceLock::new();
+pub(crate) static START_TIME: OnceLock<std::time::SystemTime> = OnceLock::new();
 
-struct RuntimeConfig {
-    config: Config,
-    compiled: CompiledConfig,
-    templates: handlebars::Handlebars<'static>,
-    effective_args: EffectiveArgs,
+pub(crate) struct RuntimeConfig {
+    pub(crate) config: Config,
+    pub(crate) compiled: CompiledConfig,
+    pub(crate) templates: handlebars::Handlebars<'static>,
+    pub(crate) effective_args: EffectiveArgs,
 }
 
-struct AppState {
-    cli_args: Args,
-    config_path: Option<String>,
-    extra_client: Client,
-    shared_proxy: SharedProxyRegistry,
-    playlist_cache: Mutex<HashMap<String, CachedText>>,
-    xmltv_cache: Mutex<HashMap<String, CachedText>>,
-    manage_json_cache: Mutex<HashMap<String, CachedText>>,
-    manage_html_cache: Mutex<HashMap<String, CachedText>>,
-    manage_raw_cache: Mutex<HashMap<String, CachedText>>,
-    stale_playlists: Mutex<HashMap<String, String>>,
-    stale_xmltv: Mutex<HashMap<String, String>>,
-    upstream_cache: AsyncMutex<HashMap<String, CachedChannels>>,
-    icon_cache: AsyncMutex<HashMap<String, CachedBytes>>,
-    upstream_flights: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
-    icon_flights: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
-    upstream_auth: Arc<UpstreamAuthManager>,
-    runtime: RwLock<RuntimeConfig>,
+pub(crate) struct AppState {
+    pub(crate) cli_args: Args,
+    pub(crate) config_path: Option<String>,
+    pub(crate) shared_proxy: SharedProxyRegistry,
+    pub(crate) caches: CacheStore,
+    pub(crate) upstream_auth: Arc<UpstreamAuthManager>,
+    pub(crate) runtime: RwLock<Arc<RuntimeConfig>>,
+}
+
+impl AppState {
+    pub(crate) fn runtime(&self) -> Arc<RuntimeConfig> {
+        self.runtime
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
 fn merge_arg(opt: Option<String>, fallback: Option<String>, default: &str) -> String {
@@ -124,7 +96,7 @@ fn normalize_opt(opt: Option<String>) -> Option<String> {
     })
 }
 
-fn html_escape(input: &str) -> String {
+pub(crate) fn html_escape(input: &str) -> String {
     if !input
         .bytes()
         .any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\''))
@@ -145,28 +117,59 @@ fn html_escape(input: &str) -> String {
     escaped
 }
 
-fn build_effective_args(args: &Args, config: &Config) -> Result<EffectiveArgs> {
+pub(crate) fn build_effective_args(args: &Args, config: &Config) -> Result<EffectiveArgs> {
     let app = &config.app;
-    let user = args.user.clone().or(app.user.clone());
-    let passwd = args.passwd.clone().or(app.passwd.clone());
-    let mac = args.mac.clone().or(app.mac.clone());
-    if user.is_none() || passwd.is_none() || mac.is_none() {
-        return Err(anyhow!(
-            "Missing user/passwd/mac. Provide via CLI or config [app]."
-        ));
+    let udp_proxy = args.udp_proxy || app.udp_proxy;
+    let rtsp_proxy = args.rtsp_proxy || app.rtsp_proxy;
+
+    let workers = args.workers.or(app.workers);
+    if matches!(workers, Some(0)) {
+        return Err(anyhow!("workers must be at least 1"));
     }
+
+    let user = normalize_opt(merge_opt(args.user.clone(), app.user.clone()));
+    let passwd = normalize_opt(merge_opt(args.passwd.clone(), app.passwd.clone()));
+    let mac = normalize_opt(merge_opt(args.mac.clone(), app.mac.clone()));
+
+    let upstream = match (user, passwd, mac) {
+        (Some(user), Some(passwd), Some(mac)) => Some(UpstreamCredentials {
+            user,
+            passwd,
+            mac,
+            imei: merge_arg(args.imei.clone(), app.imei.clone(), ""),
+            address: merge_arg(args.address.clone(), app.address.clone(), ""),
+        }),
+        (None, None, None) if udp_proxy || rtsp_proxy => None,
+        (None, None, None) => {
+            return Err(anyhow!(
+                "Missing user/passwd/mac and neither udp_proxy nor rtsp_proxy is enabled. \
+                 Provide upstream credentials via CLI or config [app], or enable udp_proxy/rtsp_proxy."
+            ));
+        }
+        _ => {
+            return Err(anyhow!(
+                "Incomplete upstream credentials: user, passwd, and mac must all be provided together, \
+                 or all omitted for standalone proxy-only mode."
+            ));
+        }
+    };
+
+    let bind = normalize_opt(merge_opt(args.bind.clone(), app.bind.clone()))
+        .unwrap_or_else(|| "0.0.0.0:7878".to_string());
+    let bind_interface = normalize_opt(merge_opt(
+        args.bind_interface.clone(),
+        app.bind_interface.clone(),
+    ));
+    let interface = normalize_opt(merge_opt(args.interface.clone(), app.interface.clone()));
+
     Ok(EffectiveArgs {
-        user: user.unwrap(),
-        passwd: passwd.unwrap(),
-        mac: mac.unwrap(),
-        imei: merge_arg(args.imei.clone(), app.imei.clone(), ""),
-        bind: merge_arg(args.bind.clone(), app.bind.clone(), "0.0.0.0:7878"),
-        address: merge_arg(args.address.clone(), app.address.clone(), ""),
-        interface: normalize_opt(merge_opt(args.interface.clone(), app.interface.clone())),
-        extra_playlist: args.extra_playlist.clone(),
-        extra_xmltv: args.extra_xmltv.clone(),
-        udp_proxy: args.udp_proxy || app.udp_proxy,
-        rtsp_proxy: args.rtsp_proxy || app.rtsp_proxy,
+        upstream,
+        bind,
+        bind_interface,
+        workers,
+        interface,
+        udp_proxy,
+        rtsp_proxy,
         fcc_enabled: config.fcc.enabled,
         fcc_max_redirects: config.fcc.max_redirects,
         fcc_switch_extra_packets: config.fcc.switch_extra_packets,
@@ -174,173 +177,76 @@ fn build_effective_args(args: &Args, config: &Config) -> Result<EffectiveArgs> {
     })
 }
 
-fn output_effective_args(state: &AppState) -> Result<EffectiveArgs> {
-    let runtime = state
-        .runtime
-        .read()
-        .map_err(|_| anyhow!("Config lock poisoned"))?;
-    Ok(runtime.effective_args.clone())
-}
-
-fn upstream_cache_key(args: &EffectiveArgs, need_epg: bool, scheme: &str, host: &str) -> String {
+pub(crate) fn upstream_cache_key(
+    creds: &UpstreamCredentials,
+    interface: Option<&str>,
+    need_epg: bool,
+) -> String {
     let identity = format!(
-        "{}\0{}\0{}\0{}\0{}\0{:?}\0{}\0{}\0{}\0{}\0{}",
-        args.user,
-        args.passwd,
-        args.mac,
-        args.imei,
-        args.address,
-        args.interface,
-        args.udp_proxy,
-        args.rtsp_proxy,
-        args.fcc_enabled,
-        scheme,
-        host
+        "{}\0{}\0{}\0{}\0{}\0{:?}",
+        creds.user, creds.passwd, creds.mac, creds.imei, creds.address, interface,
     );
     format!("{:x}|epg={need_epg}", md5::compute(identity.as_bytes()))
 }
 
-async fn get_channels_cached(
+pub(crate) async fn get_channels_cached(
     state: &AppState,
     args: &EffectiveArgs,
     need_epg: bool,
-    scheme: &str,
-    host: &str,
 ) -> Result<Vec<Channel>> {
-    let key = upstream_cache_key(args, need_epg, scheme, host);
-    {
-        let mut cache = state.upstream_cache.lock().await;
-        let now = std::time::Instant::now();
-        cache.retain(|_, cached| cached.expires_at > now);
-        if let Some(cached) = cache.get(&key) {
-            return Ok(cached.channels.clone());
-        }
-    }
-
-    let flight = {
-        let mut flights = state.upstream_flights.lock().await;
-        flights
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
+    let Some(creds) = args.upstream.as_ref() else {
+        return Ok(Vec::new());
     };
-    let _flight_guard = flight.lock().await;
-    if let Some(channels) = state
-        .upstream_cache
-        .lock()
+    let key = upstream_cache_key(creds, args.interface.as_deref(), need_epg);
+    let ttl = if need_epg {
+        EPG_CACHE_TTL
+    } else {
+        CHANNEL_CACHE_TTL
+    };
+    state
+        .caches
+        .get_or_try_init_channels(key, ttl, || {
+            get_channels(
+                &state.upstream_auth,
+                creds,
+                args.interface.as_deref(),
+                need_epg,
+            )
+        })
         .await
-        .get(&key)
-        .filter(|cached| cached.expires_at > std::time::Instant::now())
-        .map(|cached| cached.channels.clone())
-    {
-        return Ok(channels);
-    }
-
-    let channels = match get_channels(args, need_epg, scheme, host).await {
-        Ok(channels) => {
-            state.upstream_auth.mark_success();
-            channels
-        }
-        Err(error) => {
-            state.upstream_flights.lock().await.remove(&key);
-            return Err(error);
-        }
-    };
-    let mut cache = state.upstream_cache.lock().await;
-    if cache.len() >= MAX_UPSTREAM_CACHE_ENTRIES
-        && let Some(oldest) = cache
-            .iter()
-            .min_by_key(|(_, cached)| cached.expires_at)
-            .map(|(key, _)| key.clone())
-    {
-        cache.remove(&oldest);
-    }
-    cache.insert(
-        key.clone(),
-        CachedChannels {
-            expires_at: std::time::Instant::now()
-                + if need_epg {
-                    EPG_CACHE_TTL
-                } else {
-                    CHANNEL_CACHE_TTL
-                },
-            channels: channels.clone(),
-        },
-    );
-    drop(cache);
-    state.upstream_flights.lock().await.remove(&key);
-    Ok(channels)
 }
 
-async fn get_icon_cached(state: &AppState, args: &EffectiveArgs, id: &str) -> Result<Vec<u8>> {
+pub(crate) async fn get_icon_cached(
+    state: &AppState,
+    creds: &UpstreamCredentials,
+    interface: Option<&str>,
+    id: &str,
+) -> Result<Vec<u8>> {
     let key = format!(
         "{:x}|{}",
         md5::compute(
             format!(
                 "{}\0{}\0{}\0{:?}",
-                args.user, args.passwd, args.mac, args.interface
+                creds.user, creds.passwd, creds.mac, interface
             )
             .as_bytes()
         ),
         id
     );
-    {
-        let mut cache = state.icon_cache.lock().await;
-        let now = std::time::Instant::now();
-        cache.retain(|_, cached| cached.expires_at > now);
-        if let Some(cached) = cache.get(&key) {
-            return Ok(cached.body.clone());
-        }
-    }
-
-    let flight = {
-        let mut flights = state.icon_flights.lock().await;
-        flights
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
-    };
-    let _flight_guard = flight.lock().await;
-    if let Some(body) = state
-        .icon_cache
-        .lock()
+    state
+        .caches
+        .get_or_try_init_icon(key, || get_icon(&state.upstream_auth, creds, interface, id))
         .await
-        .get(&key)
-        .filter(|cached| cached.expires_at > std::time::Instant::now())
-        .map(|cached| cached.body.clone())
-    {
-        return Ok(body);
-    }
-
-    let icon = match get_icon(args, id).await {
-        Ok(icon) => icon,
-        Err(error) => {
-            state.icon_flights.lock().await.remove(&key);
-            return Err(error);
-        }
-    };
-    let mut cache = state.icon_cache.lock().await;
-    if cache.len() >= MAX_ICON_CACHE_ENTRIES
-        && let Some(oldest) = cache
-            .iter()
-            .min_by_key(|(_, cached)| cached.expires_at)
-            .map(|(key, _)| key.clone())
-    {
-        cache.remove(&oldest);
-    }
-    cache.insert(
-        key.clone(),
-        CachedBytes {
-            expires_at: std::time::Instant::now() + ICON_CACHE_TTL,
-            body: icon.clone(),
-        },
-    );
-    drop(cache);
-    state.icon_flights.lock().await.remove(&key);
-    Ok(icon)
 }
 
-fn build_local_entries(
+fn rewrite_rtsp_url(raw: &str, rtsp_proxy: bool, scheme: &str, host: &str) -> String {
+    if rtsp_proxy && let Some(rest) = raw.strip_prefix("rtsp://") {
+        return format!("{scheme}://{host}/rtsp/{rest}");
+    }
+    raw.to_string()
+}
+
+pub(crate) fn build_local_entries(
     channels: Vec<Channel>,
     args: &EffectiveArgs,
     scheme: &str,
@@ -352,21 +258,40 @@ fn build_local_entries(
     let capacity = limit.unwrap_or(channels.len()).min(channels.len());
     let mut entries = Vec::with_capacity(capacity);
     for (index, c) in (start_index..).zip(channels.into_iter().take(limit.unwrap_or(usize::MAX))) {
+        let rtsp_url = rewrite_rtsp_url(&c.rtsp, args.rtsp_proxy, scheme, host);
         let url = if args.udp_proxy {
-            c.igmp.clone().unwrap_or_else(|| c.rtsp.clone())
+            if let Some(raw_igmp) = c.igmp.as_deref() {
+                let mut proxied = if let Some(rest) = raw_igmp.strip_prefix("igmp://") {
+                    format!("{scheme}://{host}/udp/{rest}")
+                } else {
+                    raw_igmp.to_string()
+                };
+                if args.fcc_enabled
+                    && let Some(fcc) = c.fcc_server.as_deref()
+                {
+                    let sep = if proxied.contains('?') { '&' } else { '?' };
+                    proxied.push(sep);
+                    proxied.push_str("fcc=");
+                    proxied.push_str(fcc);
+                }
+                proxied
+            } else {
+                rtsp_url
+            }
         } else {
-            c.rtsp.clone()
+            rtsp_url
         };
-        let (catchup, catchup_source, catchup_attr) = if let Some(url) = c.time_shift_url.as_ref() {
-            let source = format!("{}&playseek={}", url, playseek);
-            let attr = format!(
-                r#" catchup="default" catchup-source="{}&playseek={}" "#,
-                url, playseek
-            );
-            ("default".to_string(), source, attr)
-        } else {
-            (String::new(), String::new(), String::new())
-        };
+
+        let (catchup, catchup_source, catchup_attr) =
+            if let Some(raw_ts) = c.time_shift_url.as_ref() {
+                let ts_url = rewrite_rtsp_url(raw_ts, args.rtsp_proxy, scheme, host);
+                let source = format!("{ts_url}&playseek={playseek}");
+                let attr = format!(r#" catchup="default" catchup-source="{source}" "#);
+                ("default".to_string(), source, attr)
+            } else {
+                (String::new(), String::new(), String::new())
+            };
+
         let entry = ChannelEntry {
             key: format!("gd:{}:{}", c.id, index),
             source: String::from("gd-iptv"),
@@ -406,7 +331,7 @@ fn append_auth_token(url: &str, token: &str) -> String {
     parsed.to_string()
 }
 
-fn protect_local_entry_urls(entries: &mut [ChannelEntry], config: &Config) {
+pub(crate) fn protect_local_entry_urls(entries: &mut [ChannelEntry], config: &Config) {
     for entry in entries.iter_mut().filter(|entry| entry.source == "gd-iptv") {
         let endpoint = reqwest::Url::parse(&entry.url).ok().and_then(|url| {
             let path = url.path();
@@ -441,6 +366,115 @@ fn protect_local_entry_urls(entries: &mut [ChannelEntry], config: &Config) {
             );
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum ReloadError {
+    NoConfigPath,
+    LoadOrCompile(anyhow::Error),
+    InvalidArgs(anyhow::Error),
+    ListenerChanged(String),
+}
+
+impl fmt::Display for ReloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReloadError::NoConfigPath => write!(f, "No config path specified"),
+            ReloadError::LoadOrCompile(e) => write!(f, "{e}"),
+            ReloadError::InvalidArgs(e) => write!(f, "{e}"),
+            ReloadError::ListenerChanged(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+pub(crate) fn reload_runtime_config(
+    state: &AppState,
+) -> std::result::Result<Arc<RuntimeConfig>, ReloadError> {
+    let Some(path) = state.config_path.as_deref() else {
+        return Err(ReloadError::NoConfigPath);
+    };
+    let config = load_config(Some(path)).map_err(ReloadError::LoadOrCompile)?;
+    let compiled = compile_config(&config).map_err(ReloadError::LoadOrCompile)?;
+    let templates = build_templates(&config).map_err(ReloadError::LoadOrCompile)?;
+    let effective_args =
+        build_effective_args(&state.cli_args, &config).map_err(ReloadError::InvalidArgs)?;
+
+    let current = state.runtime();
+    if effective_args.bind != current.effective_args.bind
+        || effective_args.bind_interface != current.effective_args.bind_interface
+        || effective_args.workers != current.effective_args.workers
+    {
+        return Err(ReloadError::ListenerChanged(
+            "HTTP listener settings (bind, bind_interface, or workers) changed; \
+             restart the service to apply this configuration"
+                .to_string(),
+        ));
+    }
+
+    state
+        .upstream_auth
+        .on_config_change(&current.effective_args, &effective_args);
+
+    let next_runtime = Arc::new(RuntimeConfig {
+        config,
+        compiled,
+        templates,
+        effective_args,
+    });
+    *state.runtime.write().unwrap_or_else(|e| e.into_inner()) = next_runtime.clone();
+    state.caches.clear_all();
+    info!("Reloaded configuration from {path}");
+    Ok(next_runtime)
+}
+
+fn bind_socket_addr(
+    addr: SocketAddr,
+    bind_interface: Option<&str>,
+) -> std::io::Result<TcpListener> {
+    let domain = Domain::for_address(addr);
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() && addr.ip().is_unspecified() {
+        let _ = socket.set_only_v6(false);
+    }
+    socket.set_reuse_address(true)?;
+
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    if let Some(iface) = bind_interface {
+        socket.bind_device(Some(iface.as_bytes()))?;
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+    if let Some(iface) = bind_interface {
+        warn!(
+            "bind_interface ({iface}) requires SO_BINDTODEVICE on Linux/Android/Fuchsia; \
+             binding {addr} without device restriction"
+        );
+    }
+
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
+}
+
+pub(crate) fn bind_http_listener(
+    bind: &str,
+    bind_interface: Option<&str>,
+) -> std::io::Result<TcpListener> {
+    let addrs: Vec<SocketAddr> = bind.to_socket_addrs()?.collect();
+    if addrs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Unable to resolve bind address `{bind}`"),
+        ));
+    }
+    let mut last_err = None;
+    for addr in addrs {
+        match bind_socket_addr(addr, bind_interface) {
+            Ok(listener) => return Ok(listener),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap())
 }
 
 mod handlers;
@@ -483,9 +517,14 @@ pub async fn run() -> std::io::Result<()> {
         }
     };
     debug!(
-        "Effective runtime config bind={} interface={:?} udp_proxy={} rtsp_proxy={} fcc_enabled={} fcc_max_redirects={} fcc_switch_extra_packets={} fcc_switch_min_unicast_ms={}",
+        "Effective runtime config bind={} bind_interface={:?} workers={:?} interface={:?} \
+         proxy_only={} udp_proxy={} rtsp_proxy={} fcc_enabled={} fcc_max_redirects={} \
+         fcc_switch_extra_packets={} fcc_switch_min_unicast_ms={}",
         effective_args.bind,
+        effective_args.bind_interface,
+        effective_args.workers,
         effective_args.interface,
+        effective_args.upstream.is_none(),
         effective_args.udp_proxy,
         effective_args.rtsp_proxy,
         effective_args.fcc_enabled,
@@ -494,36 +533,25 @@ pub async fn run() -> std::io::Result<()> {
         effective_args.fcc_switch_min_unicast_ms
     );
 
+    let listener = bind_http_listener(
+        &effective_args.bind,
+        effective_args.bind_interface.as_deref(),
+    )?;
+    let workers = effective_args.workers;
+
     let upstream_auth = Arc::new(UpstreamAuthManager::default());
     let state = Data::new(AppState {
         cli_args: args.clone(),
         config_path: args.config.clone(),
-        extra_client: Client::builder()
-            .timeout(EXTRA_FETCH_TIMEOUT)
-            .build()
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to build extra fetch client: {}", e);
-                exit(1);
-            }),
         shared_proxy: SharedProxyRegistry::new(),
-        playlist_cache: Mutex::new(HashMap::new()),
-        xmltv_cache: Mutex::new(HashMap::new()),
-        manage_json_cache: Mutex::new(HashMap::new()),
-        manage_html_cache: Mutex::new(HashMap::new()),
-        manage_raw_cache: Mutex::new(HashMap::new()),
-        stale_playlists: Mutex::new(HashMap::new()),
-        stale_xmltv: Mutex::new(HashMap::new()),
-        upstream_cache: AsyncMutex::new(HashMap::new()),
-        icon_cache: AsyncMutex::new(HashMap::new()),
-        upstream_flights: AsyncMutex::new(HashMap::new()),
-        icon_flights: AsyncMutex::new(HashMap::new()),
-        upstream_auth: upstream_auth.clone(),
-        runtime: RwLock::new(RuntimeConfig {
+        caches: CacheStore::new(),
+        upstream_auth,
+        runtime: RwLock::new(Arc::new(RuntimeConfig {
             config,
             compiled,
             templates,
-            effective_args: effective_args.clone(),
-        }),
+            effective_args,
+        })),
     });
 
     let periodic_state = state.clone();
@@ -535,13 +563,11 @@ pub async fn run() -> std::io::Result<()> {
         interval.tick().await;
         loop {
             interval.tick().await;
-            let args = match output_effective_args(&periodic_state) {
-                Ok(args) => args,
-                Err(error) => {
-                    warn!("Periodic authorization refresh skipped: {error}");
-                    continue;
-                }
-            };
+            let args = periodic_state.runtime().effective_args.clone();
+            if args.upstream.is_none() {
+                debug!("Periodic upstream authorization refresh skipped in proxy-only mode");
+                continue;
+            }
             let retry_delays = [
                 Duration::ZERO,
                 Duration::from_secs(60),
@@ -578,8 +604,27 @@ pub async fn run() -> std::io::Result<()> {
         }
     });
 
-    let bind_addr = effective_args.bind.clone();
-    HttpServer::new(move || {
+    #[cfg(unix)]
+    {
+        let sighup_state = state.clone();
+        tokio::spawn(async move {
+            let mut sig =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(sig) => sig,
+                    Err(error) => {
+                        warn!("Failed to install SIGHUP reload handler: {error}");
+                        return;
+                    }
+                };
+            while sig.recv().await.is_some() {
+                if let Err(error) = reload_runtime_config(&sighup_state) {
+                    warn!("SIGHUP reload warning: {error}");
+                }
+            }
+        });
+    }
+
+    let mut server = HttpServer::new(move || {
         App::new()
             .service(xmltv)
             .service(playlist_handler)
@@ -596,8 +641,9 @@ pub async fn run() -> std::io::Result<()> {
             .service(manage_channels_raw)
             .service(manage_channels_html)
             .app_data(state.clone())
-    })
-    .bind(bind_addr)?
-    .run()
-    .await
+    });
+    if let Some(workers) = workers {
+        server = server.workers(workers);
+    }
+    server.listen(listener)?.run().await
 }

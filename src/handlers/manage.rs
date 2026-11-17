@@ -1,13 +1,23 @@
-use super::super::*;
+use crate::{
+    AppState, ManageTestResult, ReloadError, START_TIME, build_local_entries, check_auth,
+    get_channel_list_raw, get_channels_cached, html_escape,
+    playlist::{
+        EntryBuildContext, add_alias_and_resolution_for_name, finalize_entries,
+        resolve_group_for_alias,
+    },
+    protect_local_entry_urls, redacted_config, reload_runtime_config, with_auth_cookie,
+};
+use actix_web::{
+    HttpRequest, HttpResponse, Responder, get,
+    http::header,
+    post,
+    web::{Data, Query},
+};
+use std::collections::BTreeMap;
 
 #[get("/manage/config")]
 pub(crate) async fn manage_config(state: Data<AppState>, req: HttpRequest) -> impl Responder {
-    let runtime = match state.runtime.read() {
-        Ok(guard) => guard,
-        Err(_) => {
-            return HttpResponse::InternalServerError().body("Config lock poisoned");
-        }
-    };
+    let runtime = state.runtime();
     if !runtime.config.manage.enabled {
         return HttpResponse::NotFound().body("Manage disabled");
     }
@@ -30,12 +40,7 @@ pub(crate) async fn manage_config(state: Data<AppState>, req: HttpRequest) -> im
 
 #[get("/manage")]
 pub(crate) async fn manage_index(state: Data<AppState>, req: HttpRequest) -> impl Responder {
-    let runtime = match state.runtime.read() {
-        Ok(guard) => guard,
-        Err(_) => {
-            return HttpResponse::InternalServerError().body("Config lock poisoned");
-        }
-    };
+    let runtime = state.runtime();
     if !runtime.config.manage.enabled {
         return HttpResponse::NotFound().body("Manage disabled");
     }
@@ -45,7 +50,7 @@ pub(crate) async fn manage_index(state: Data<AppState>, req: HttpRequest) -> imp
     let start = START_TIME
         .get()
         .cloned()
-        .unwrap_or(std::time::SystemTime::now());
+        .unwrap_or_else(std::time::SystemTime::now);
     let uptime = start.elapsed().map(|d| d.as_secs()).unwrap_or(0);
     let html = super::views::render_manage_index(
         uptime,
@@ -64,92 +69,25 @@ pub(crate) async fn manage_index(state: Data<AppState>, req: HttpRequest) -> imp
 
 #[post("/manage/reload")]
 pub(crate) async fn manage_reload(state: Data<AppState>, req: HttpRequest) -> impl Responder {
-    let current_bind = {
-        let current = match state.runtime.read() {
-            Ok(guard) => guard,
-            Err(_) => {
-                return HttpResponse::InternalServerError().body("Config lock poisoned");
-            }
-        };
-        if !current.config.manage.enabled {
-            return HttpResponse::NotFound().body("Manage disabled");
-        }
-        if !check_auth(&req, &current.config, "manage") {
-            return HttpResponse::Unauthorized().body("Unauthorized");
-        }
-        current.effective_args.bind.clone()
-    };
+    let current = state.runtime();
+    if !current.config.manage.enabled {
+        return HttpResponse::NotFound().body("Manage disabled");
+    }
+    if !check_auth(&req, &current.config, "manage") {
+        return HttpResponse::Unauthorized().body("Unauthorized");
+    }
 
-    let path = match state.config_path.as_ref() {
-        Some(path) => path.clone(),
-        None => {
-            return HttpResponse::BadRequest().body("No config path specified");
+    match reload_runtime_config(&state) {
+        Ok(next) => with_auth_cookie(&req, &next.config, "manage", HttpResponse::Ok().body("OK")),
+        Err(ReloadError::NoConfigPath) => {
+            HttpResponse::BadRequest().body("No config path specified")
         }
-    };
-    let config = match load_config(Some(&path)) {
-        Ok(cfg) => cfg,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
-    };
-    let compiled = match compile_config(&config) {
-        Ok(c) => c,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
-    };
-    let templates = match build_templates(&config) {
-        Ok(t) => t,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
-    };
-    let effective_args = match build_effective_args(&state.cli_args, &config) {
-        Ok(args) => args,
-        Err(e) => return HttpResponse::BadRequest().body(format!("Error: {e}")),
-    };
-    if effective_args.bind != current_bind {
-        return HttpResponse::Conflict()
-            .body("Bind address changed; restart the service to apply this configuration");
+        Err(ReloadError::InvalidArgs(e)) => HttpResponse::BadRequest().body(format!("Error: {e}")),
+        Err(ReloadError::ListenerChanged(msg)) => HttpResponse::Conflict().body(msg),
+        Err(ReloadError::LoadOrCompile(e)) => {
+            HttpResponse::InternalServerError().body(format!("Error: {e}"))
+        }
     }
-    let response_config = {
-        let mut runtime = match state.runtime.write() {
-            Ok(guard) => guard,
-            Err(_) => {
-                return HttpResponse::InternalServerError().body("Config lock poisoned");
-            }
-        };
-        runtime.config = config;
-        runtime.compiled = compiled;
-        runtime.templates = templates;
-        runtime.effective_args = effective_args;
-        runtime.config.clone()
-    };
-    if let Ok(mut cache) = state.playlist_cache.lock() {
-        cache.clear();
-    }
-    if let Ok(mut cache) = state.xmltv_cache.lock() {
-        cache.clear();
-    }
-    if let Ok(mut cache) = state.manage_json_cache.lock() {
-        cache.clear();
-    }
-    if let Ok(mut cache) = state.manage_html_cache.lock() {
-        cache.clear();
-    }
-    if let Ok(mut cache) = state.manage_raw_cache.lock() {
-        cache.clear();
-    }
-    if let Ok(mut cache) = state.stale_playlists.lock() {
-        cache.clear();
-    }
-    if let Ok(mut cache) = state.stale_xmltv.lock() {
-        cache.clear();
-    }
-    state.upstream_cache.lock().await.clear();
-    state.icon_cache.lock().await.clear();
-    state.upstream_flights.lock().await.clear();
-    state.icon_flights.lock().await.clear();
-    with_auth_cookie(
-        &req,
-        &response_config,
-        "manage",
-        HttpResponse::Ok().body("OK"),
-    )
 }
 
 #[get("/manage/test")]
@@ -158,21 +96,15 @@ pub(crate) async fn manage_test(
     req: HttpRequest,
     params: Query<BTreeMap<String, String>>,
 ) -> impl Responder {
-    let runtime = match state.runtime.read() {
-        Ok(guard) => guard,
-        Err(_) => {
-            return HttpResponse::InternalServerError().body("Config lock poisoned");
-        }
-    };
+    let runtime = state.runtime();
     if !runtime.config.manage.enabled {
         return HttpResponse::NotFound().body("Manage disabled");
     }
     if !check_auth(&req, &runtime.config, "manage") {
         return HttpResponse::Unauthorized().body("Unauthorized");
     }
-    let name = match params.get("name") {
-        Some(v) => v.to_string(),
-        None => return HttpResponse::BadRequest().body("Missing name"),
+    let Some(name) = params.get("name").cloned() else {
+        return HttpResponse::BadRequest().body("Missing name");
     };
     let ctx = EntryBuildContext {
         config: &runtime.config,
@@ -210,19 +142,25 @@ pub(crate) async fn manage_channels(
     req: HttpRequest,
     params: Query<BTreeMap<String, String>>,
 ) -> impl Responder {
-    let (enabled, need_auth) = match state.runtime.read() {
-        Ok(guard) => (
-            guard.config.manage.enabled,
-            check_auth(&req, &guard.config, "manage"),
-        ),
-        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-    };
-    if !enabled {
+    let runtime = state.runtime();
+    if !runtime.config.manage.enabled {
         return HttpResponse::NotFound().body("Manage disabled");
     }
-    if !need_auth {
+    if !check_auth(&req, &runtime.config, "manage") {
         return HttpResponse::Unauthorized().body("Unauthorized");
     }
+
+    if runtime.effective_args.upstream.is_none() {
+        return with_auth_cookie(
+            &req,
+            &runtime.config,
+            "manage",
+            HttpResponse::Ok()
+                .content_type("application/json")
+                .body("[]"),
+        );
+    }
+
     let scheme = req.connection_info().scheme().to_owned();
     let host = req.connection_info().host().to_owned();
     let user_agent = req
@@ -230,30 +168,22 @@ pub(crate) async fn manage_channels(
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("Unknown");
-    let is_kodi = user_agent.to_lowercase().contains("kodi");
+    let is_kodi = user_agent.to_ascii_lowercase().contains("kodi");
     let playseek = if is_kodi {
         "{utc:YmdHMS}-{utcend:YmdHMS}"
     } else {
         "${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"
     };
-    let output_args = match output_effective_args(&state) {
-        Ok(args) => args,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
-    };
+    let output_args = &runtime.effective_args;
     let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok());
     let cache_key = format!(
-        "{}|{}|{}|{}|{}",
-        scheme,
-        host,
-        is_kodi,
+        "{scheme}|{host}|{is_kodi}|{}|{}|{}|{}",
+        output_args.udp_proxy,
+        output_args.rtsp_proxy,
         output_args.fcc_enabled,
         limit.unwrap_or(usize::MAX)
     );
-    if let Some(text) = get_cached_text(&state.manage_json_cache, &cache_key) {
-        let runtime = match state.runtime.read() {
-            Ok(guard) => guard,
-            Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-        };
+    if let Some(text) = state.caches.get_manage_json(&cache_key) {
         return with_auth_cookie(
             &req,
             &runtime.config,
@@ -263,39 +193,27 @@ pub(crate) async fn manage_channels(
                 .body(text),
         );
     }
-    let channels = match get_channels_cached(&state, &output_args, false, &scheme, &host).await {
+
+    let expected_gen = state.caches.generation();
+    let channels = match get_channels_cached(&state, output_args, false).await {
         Ok(ch) => ch,
         Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
     };
-    let mut entries =
-        build_local_entries(channels, &output_args, &scheme, &host, playseek, 0, limit);
-    if !output_args.extra_playlist.is_empty() && limit.is_none_or(|limit| entries.len() < limit) {
-        let mut index = entries.len();
-        for (source_index, content) in
-            fetch_extra_playlists(&state.extra_client, &output_args.extra_playlist).await
-        {
-            let source = format!("extra:{source_index}");
-            let mut extra_entries = parse_m3u_playlist(&content, &source, index);
-            if let Some(limit) = limit {
-                let remaining = limit.saturating_sub(entries.len());
-                extra_entries.truncate(remaining);
-            }
-            index += extra_entries.len();
-            entries.append(&mut extra_entries);
-            if limit.is_some_and(|limit| entries.len() >= limit) {
-                break;
-            }
-        }
-    }
-    let runtime = match state.runtime.read() {
-        Ok(guard) => guard,
-        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-    };
+    let live = state.runtime();
+    let mut entries = build_local_entries(
+        channels,
+        &live.effective_args,
+        &scheme,
+        &host,
+        playseek,
+        0,
+        limit,
+    );
     let ctx = EntryBuildContext {
-        config: &runtime.config,
-        compiled: &runtime.compiled,
+        config: &live.config,
+        compiled: &live.compiled,
     };
-    protect_local_entry_urls(&mut entries, &runtime.config);
+    protect_local_entry_urls(&mut entries, &live.config);
     let mut entries = finalize_entries(entries, &ctx);
     if let Some(limit) = limit
         && entries.len() > limit
@@ -304,15 +222,12 @@ pub(crate) async fn manage_channels(
     }
     match serde_json::to_string_pretty(&entries) {
         Ok(text) => {
-            put_cached_text(
-                &state.manage_json_cache,
-                cache_key,
-                text.clone(),
-                MANAGE_CACHE_TTL,
-            );
+            state
+                .caches
+                .put_manage_json(expected_gen, cache_key, text.clone());
             with_auth_cookie(
                 &req,
-                &runtime.config,
+                &live.config,
                 "manage",
                 HttpResponse::Ok()
                     .content_type("application/json")
@@ -325,25 +240,20 @@ pub(crate) async fn manage_channels(
 
 #[get("/manage/channels/raw")]
 pub(crate) async fn manage_channels_raw(state: Data<AppState>, req: HttpRequest) -> impl Responder {
-    let (enabled, need_auth) = match state.runtime.read() {
-        Ok(guard) => (
-            guard.config.manage.enabled,
-            check_auth(&req, &guard.config, "manage"),
-        ),
-        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-    };
-    if !enabled {
+    let runtime = state.runtime();
+    if !runtime.config.manage.enabled {
         return HttpResponse::NotFound().body("Manage disabled");
     }
-    if !need_auth {
+    if !check_auth(&req, &runtime.config, "manage") {
         return HttpResponse::Unauthorized().body("Unauthorized");
     }
+    let Some(creds) = runtime.effective_args.upstream.as_ref() else {
+        return HttpResponse::ServiceUnavailable()
+            .body("Raw channel list is unavailable in proxy-only mode (no upstream credentials)");
+    };
+
     let cache_key = String::from("raw");
-    if let Some(text) = get_cached_text(&state.manage_raw_cache, &cache_key) {
-        let runtime = match state.runtime.read() {
-            Ok(guard) => guard,
-            Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-        };
+    if let Some(text) = state.caches.get_manage_raw(&cache_key) {
         return with_auth_cookie(
             &req,
             &runtime.config,
@@ -357,27 +267,25 @@ pub(crate) async fn manage_channels_raw(state: Data<AppState>, req: HttpRequest)
                 .body(text),
         );
     }
-    let output_args = match output_effective_args(&state) {
-        Ok(args) => args,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {e}")),
-    };
-    let text = match get_channel_list_raw(&output_args).await {
+
+    let expected_gen = state.caches.generation();
+    let text = match get_channel_list_raw(
+        &state.upstream_auth,
+        creds,
+        runtime.effective_args.interface.as_deref(),
+    )
+    .await
+    {
         Ok(text) => text,
         Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
     };
-    put_cached_text(
-        &state.manage_raw_cache,
-        cache_key,
-        text.clone(),
-        MANAGE_CACHE_TTL,
-    );
-    let runtime = match state.runtime.read() {
-        Ok(guard) => guard,
-        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-    };
+    state
+        .caches
+        .put_manage_raw(expected_gen, cache_key, text.clone());
+    let live = state.runtime();
     with_auth_cookie(
         &req,
-        &runtime.config,
+        &live.config,
         "manage",
         HttpResponse::Ok()
             .insert_header((header::CONTENT_TYPE, "text/plain; charset=utf-8"))
@@ -395,50 +303,17 @@ pub(crate) async fn manage_channels_html(
     req: HttpRequest,
     params: Query<BTreeMap<String, String>>,
 ) -> impl Responder {
-    let (enabled, need_auth) = match state.runtime.read() {
-        Ok(guard) => (
-            guard.config.manage.enabled,
-            check_auth(&req, &guard.config, "manage"),
-        ),
-        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-    };
-    if !enabled {
+    let runtime = state.runtime();
+    if !runtime.config.manage.enabled {
         return HttpResponse::NotFound().body("Manage disabled");
     }
-    if !need_auth {
+    if !check_auth(&req, &runtime.config, "manage") {
         return HttpResponse::Unauthorized().body("Unauthorized");
     }
-    let scheme = req.connection_info().scheme().to_owned();
-    let host = req.connection_info().host().to_owned();
-    let user_agent = req
-        .headers()
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("Unknown");
-    let is_kodi = user_agent.to_lowercase().contains("kodi");
-    let playseek = if is_kodi {
-        "{utc:YmdHMS}-{utcend:YmdHMS}"
-    } else {
-        "${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"
-    };
-    let output_args = match output_effective_args(&state) {
-        Ok(args) => args,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
-    };
+
     let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok());
-    let cache_key = format!(
-        "{}|{}|{}|{}|{}",
-        scheme,
-        host,
-        is_kodi,
-        output_args.fcc_enabled,
-        limit.unwrap_or(usize::MAX)
-    );
-    if let Some(html) = get_cached_text(&state.manage_html_cache, &cache_key) {
-        let runtime = match state.runtime.read() {
-            Ok(guard) => guard,
-            Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-        };
+    if runtime.effective_args.upstream.is_none() {
+        let html = super::views::render_channels(&[], limit);
         return with_auth_cookie(
             &req,
             &runtime.config,
@@ -448,39 +323,59 @@ pub(crate) async fn manage_channels_html(
                 .body(html),
         );
     }
-    let channels = match get_channels_cached(&state, &output_args, false, &scheme, &host).await {
+
+    let scheme = req.connection_info().scheme().to_owned();
+    let host = req.connection_info().host().to_owned();
+    let user_agent = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("Unknown");
+    let is_kodi = user_agent.to_ascii_lowercase().contains("kodi");
+    let playseek = if is_kodi {
+        "{utc:YmdHMS}-{utcend:YmdHMS}"
+    } else {
+        "${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"
+    };
+    let output_args = &runtime.effective_args;
+    let cache_key = format!(
+        "{scheme}|{host}|{is_kodi}|{}|{}|{}|{}",
+        output_args.udp_proxy,
+        output_args.rtsp_proxy,
+        output_args.fcc_enabled,
+        limit.unwrap_or(usize::MAX)
+    );
+    if let Some(html) = state.caches.get_manage_html(&cache_key) {
+        return with_auth_cookie(
+            &req,
+            &runtime.config,
+            "manage",
+            HttpResponse::Ok()
+                .content_type("text/html; charset=utf-8")
+                .body(html),
+        );
+    }
+
+    let expected_gen = state.caches.generation();
+    let channels = match get_channels_cached(&state, output_args, false).await {
         Ok(ch) => ch,
         Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
     };
-    let mut entries =
-        build_local_entries(channels, &output_args, &scheme, &host, playseek, 0, limit);
-    if !output_args.extra_playlist.is_empty() && limit.is_none_or(|limit| entries.len() < limit) {
-        let mut index = entries.len();
-        for (source_index, content) in
-            fetch_extra_playlists(&state.extra_client, &output_args.extra_playlist).await
-        {
-            let source = format!("extra:{source_index}");
-            let mut extra_entries = parse_m3u_playlist(&content, &source, index);
-            if let Some(limit) = limit {
-                let remaining = limit.saturating_sub(entries.len());
-                extra_entries.truncate(remaining);
-            }
-            index += extra_entries.len();
-            entries.append(&mut extra_entries);
-            if limit.is_some_and(|limit| entries.len() >= limit) {
-                break;
-            }
-        }
-    }
-    let runtime = match state.runtime.read() {
-        Ok(guard) => guard,
-        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-    };
+    let live = state.runtime();
+    let mut entries = build_local_entries(
+        channels,
+        &live.effective_args,
+        &scheme,
+        &host,
+        playseek,
+        0,
+        limit,
+    );
     let ctx = EntryBuildContext {
-        config: &runtime.config,
-        compiled: &runtime.compiled,
+        config: &live.config,
+        compiled: &live.compiled,
     };
-    protect_local_entry_urls(&mut entries, &runtime.config);
+    protect_local_entry_urls(&mut entries, &live.config);
     let mut entries = finalize_entries(entries, &ctx);
     if let Some(limit) = limit
         && entries.len() > limit
@@ -489,15 +384,12 @@ pub(crate) async fn manage_channels_html(
     }
 
     let html = super::views::render_channels(&entries, limit);
-    put_cached_text(
-        &state.manage_html_cache,
-        cache_key,
-        html.clone(),
-        MANAGE_CACHE_TTL,
-    );
+    state
+        .caches
+        .put_manage_html(expected_gen, cache_key, html.clone());
     with_auth_cookie(
         &req,
-        &runtime.config,
+        &live.config,
         "manage",
         HttpResponse::Ok()
             .content_type("text/html; charset=utf-8")
@@ -507,109 +399,80 @@ pub(crate) async fn manage_channels_html(
 
 #[get("/status")]
 pub(crate) async fn status(state: Data<AppState>, req: HttpRequest) -> impl Responder {
-    let need_auth = match state.runtime.read() {
-        Ok(guard) => check_auth(&req, &guard.config, "status"),
-        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-    };
-    if !need_auth {
+    let runtime = state.runtime();
+    if !check_auth(&req, &runtime.config, "status") {
         return HttpResponse::Unauthorized().body("Unauthorized");
     }
     let start = START_TIME
         .get()
         .cloned()
-        .unwrap_or(std::time::SystemTime::now());
+        .unwrap_or_else(std::time::SystemTime::now);
     let uptime = start.elapsed().map(|d| d.as_secs()).unwrap_or(0);
 
     let channels_link = String::from("/manage/channels?limit=200");
 
-    let (
-        alias_preview,
-        group_pills,
-        group_count,
-        alias_rules,
-        protected,
-        token_set,
-        manage_enabled,
-        config_path,
-    ) = match state.runtime.read() {
-        Ok(guard) => {
-            let alias_preview = guard
-                .config
-                .alias
-                .rules
-                .iter()
-                .take(10)
-                .enumerate()
-                .map(|(i, r)| {
-                    format!(
-                        "<div class='mb-2 d-flex align-items-center'><span class='badge bg-light text-dark me-2'>{}</span> <code class='text-truncate'>{}</code> <i class='bi bi-arrow-right mx-2 text-muted'></i> <code class='text-truncate'>{}</code></div>",
-                        i + 1,
-                        html_escape(&r.pattern),
-                        html_escape(&r.replace)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("");
-            let group_pills = guard
-                .config
-                .groups
-                .entries
-                .iter()
-                .map(|g| {
-                    format!(
-                        "<span class='badge bg-primary-subtle text-primary border border-primary-subtle me-1 mb-1'>{}</span>",
-                        html_escape(&g.group)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("");
-            (
-                alias_preview,
-                group_pills,
-                guard.config.groups.entries.len(),
-                guard.config.alias.rules.len(),
-                if guard.config.auth.protect.is_empty() {
-                    String::from("none")
-                } else {
-                    guard.config.auth.protect.join(", ")
-                },
-                if guard.config.auth.token.is_empty() {
-                    "no"
-                } else {
-                    "yes"
-                },
-                if guard.config.manage.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                state
-                    .config_path
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string()),
+    let alias_preview = runtime
+        .config
+        .alias
+        .rules
+        .iter()
+        .take(10)
+        .enumerate()
+        .map(|(i, r)| {
+            format!(
+                "<div class='mb-2 d-flex align-items-center'><span class='badge bg-light text-dark me-2'>{}</span> <code class='text-truncate'>{}</code> <i class='bi bi-arrow-right mx-2 text-muted'></i> <code class='text-truncate'>{}</code></div>",
+                i + 1,
+                html_escape(&r.pattern),
+                html_escape(&r.replace)
             )
-        }
-        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let group_pills = runtime
+        .config
+        .groups
+        .entries
+        .iter()
+        .map(|g| {
+            format!(
+                "<span class='badge bg-primary-subtle text-primary border border-primary-subtle me-1 mb-1'>{}</span>",
+                html_escape(&g.group)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let group_count = runtime.config.groups.entries.len();
+    let alias_rules = runtime.config.alias.rules.len();
+    let protected = if runtime.config.auth.protect.is_empty() {
+        String::from("none")
+    } else {
+        runtime.config.auth.protect.join(", ")
     };
-    let scheme = req.connection_info().scheme().to_owned();
-    let host = req.connection_info().host().to_owned();
-    let output_args = match output_effective_args(&state) {
-        Ok(args) => args,
-        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
+    let token_set = if runtime.config.auth.token.is_empty() {
+        "no"
+    } else {
+        "yes"
     };
-    let channels_count =
-        match get_channels_cached(&state, &output_args, false, &scheme, &host).await {
-            Ok(ch) => ch.len(),
-            Err(_) => 0,
-        };
+    let manage_enabled = if runtime.config.manage.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let config_path = state
+        .config_path
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+
+    let channels_count = match get_channels_cached(&state, &runtime.effective_args, false).await {
+        Ok(ch) => ch.len(),
+        Err(_) => 0,
+    };
     let html = super::views::render_status(
         uptime,
         &config_path,
         manage_enabled,
         &protected,
         token_set,
-        output_args.extra_playlist.len(),
-        output_args.extra_xmltv.len(),
         channels_count,
         alias_rules,
         &alias_preview,
@@ -617,13 +480,10 @@ pub(crate) async fn status(state: Data<AppState>, req: HttpRequest) -> impl Resp
         group_count,
         &channels_link,
     );
-    let config = match state.runtime.read() {
-        Ok(guard) => guard.config.clone(),
-        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-    };
+    let live = state.runtime();
     with_auth_cookie(
         &req,
-        &config,
+        &live.config,
         "status",
         HttpResponse::Ok()
             .content_type("text/html; charset=utf-8")

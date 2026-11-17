@@ -4,9 +4,8 @@ use regex_lite::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
-#[derive(Default)]
 pub(crate) struct Config {
     pub(crate) app: AppConfig,
     pub(crate) fcc: FccConfig,
@@ -20,15 +19,16 @@ pub(crate) struct Config {
     pub(crate) xmltv: XmltvConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
-#[derive(Default)]
 pub(crate) struct AppConfig {
     pub(crate) user: Option<String>,
     pub(crate) passwd: Option<String>,
     pub(crate) mac: Option<String>,
     pub(crate) imei: Option<String>,
     pub(crate) bind: Option<String>,
+    pub(crate) bind_interface: Option<String>,
+    pub(crate) workers: Option<usize>,
     pub(crate) address: Option<String>,
     pub(crate) interface: Option<String>,
     pub(crate) rtsp_proxy: bool,
@@ -94,9 +94,8 @@ pub(crate) struct AliasRule {
     pub(crate) replace: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
-#[derive(Default)]
 pub(crate) struct ResolutionConfig {
     pub(crate) default_score: i32,
     pub(crate) rules: Vec<ResolutionRule>,
@@ -139,7 +138,6 @@ pub(crate) struct GroupEntry {
 pub(crate) struct SortingConfig {
     pub(crate) same_alias: Vec<String>,
     pub(crate) prefer_resolution: PreferResolutionConfig,
-    pub(crate) source_priority: Vec<String>,
 }
 
 impl Default for SortingConfig {
@@ -151,14 +149,12 @@ impl Default for SortingConfig {
                 String::from("original"),
             ],
             prefer_resolution: PreferResolutionConfig::default(),
-            source_priority: Vec::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
-#[derive(Default)]
 pub(crate) struct PreferResolutionConfig {
     pub(crate) order: Vec<String>,
 }
@@ -196,14 +192,16 @@ impl Default for AuthConfig {
                 String::from("playlist"),
                 String::from("xmltv"),
                 String::from("manage"),
+                String::from("rtsp"),
+                String::from("udp"),
+                String::from("logo"),
             ],
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
-#[derive(Default)]
 pub(crate) struct ManageConfig {
     pub(crate) enabled: bool,
 }
@@ -361,6 +359,42 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("unexpected"));
+    }
+
+    #[test]
+    fn parses_new_listener_fields_and_rejects_removed_source_priority() {
+        let parsed = toml::from_str::<Config>(
+            r#"
+                [app]
+                bind = "[::]:7088"
+                bind_interface = "br-lan"
+                workers = 2
+                udp_proxy = true
+            "#,
+        )
+        .expect("listener fields should parse");
+        assert_eq!(parsed.app.bind_interface.as_deref(), Some("br-lan"));
+        assert_eq!(parsed.app.workers, Some(2));
+        assert!(parsed.app.udp_proxy);
+
+        let removed = toml::from_str::<Config>(
+            r#"
+                [sorting]
+                source_priority = ["gd-iptv"]
+            "#,
+        )
+        .unwrap_err();
+        assert!(removed.to_string().contains("source_priority"));
+    }
+
+    #[test]
+    fn default_auth_protects_all_sensitive_endpoints() {
+        let auth = AuthConfig::default();
+        assert!(auth.token.is_empty());
+        assert_eq!(
+            auth.protect,
+            vec!["playlist", "xmltv", "manage", "rtsp", "udp", "logo"]
+        );
     }
 
     #[test]

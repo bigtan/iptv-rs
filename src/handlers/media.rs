@@ -1,91 +1,82 @@
-use super::super::*;
+use crate::{
+    AppState, apply_alias,
+    auth::check_auth,
+    build_local_entries,
+    fcc::{FccOptions, parse_fcc_server},
+    get_channels_cached, get_icon_cached,
+    playlist::{EntryBuildContext, finalize_entries, render_playlist},
+    protect_local_entry_urls, proxy,
+    rtsp_client::is_auth_status as is_rtsp_auth_status,
+    shared_proxy::{SharedProxyRecvError, SharedProxySubscribeError},
+    xmltv_output::{format_time as to_xmltv_time, render as to_xmltv},
+};
+use actix_web::{
+    HttpRequest, HttpResponse, Responder, get,
+    http::header,
+    web::{Bytes, Data, Path, Query},
+};
+use async_stream::stream;
+use chrono::Local;
+use log::{debug, warn};
+use std::{collections::BTreeMap, net::SocketAddrV4, str::FromStr};
+
+pub(crate) fn is_valid_logo_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
 
 #[get("/xmltv")]
 pub(crate) async fn xmltv(state: Data<AppState>, req: HttpRequest) -> impl Responder {
     debug!("Get EPG");
-    let (use_alias_name, need_auth) = match state.runtime.read() {
-        Ok(guard) => (
-            guard.config.xmltv.use_alias_name,
-            check_auth(&req, &guard.config, "xmltv"),
-        ),
-        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-    };
-    if !need_auth {
+    let runtime = state.runtime();
+    if !check_auth(&req, &runtime.config, "xmltv") {
         return HttpResponse::Unauthorized().body("Unauthorized");
     }
-    let scheme = req.connection_info().scheme().to_owned();
-    let host = req.connection_info().host().to_owned();
-    let output_args = match output_effective_args(&state) {
-        Ok(args) => args,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
-    };
-    let cache_key = format!("{}|{}|{}", scheme, host, output_args.fcc_enabled);
-    if let Some(xml) = get_cached_text(&state.xmltv_cache, &cache_key) {
+
+    if runtime.effective_args.upstream.is_none() {
+        let empty = to_xmltv(&[]).unwrap_or_else(|_| {
+            r#"<?xml version="1.0" encoding="UTF-8"?><tv generator-info-name="iptv-proxy" source-info-name="iptv-proxy"/>"#
+                .to_string()
+        });
+        return HttpResponse::Ok().content_type("text/xml").body(empty);
+    }
+
+    let use_alias_name = runtime.config.xmltv.use_alias_name;
+    let cache_key = format!("alias={use_alias_name}");
+    if let Some(xml) = state.caches.get_xmltv(&cache_key) {
         return HttpResponse::Ok().content_type("text/xml").body(xml);
     }
-    // parse all extra xmltv URLs in parallel using JoinSet, collect successful readers
-    let extra_readers = if !output_args.extra_xmltv.is_empty() {
-        let mut set = JoinSet::new();
-        for (i, u) in output_args.extra_xmltv.iter().enumerate() {
-            let u = u.clone();
-            let client = state.extra_client.clone();
-            set.spawn(async move { (i, parse_extra_xml(&client, &u).await) });
-        }
-        let mut readers = Vec::new();
-        while let Some(res) = set.join_next().await {
-            match res {
-                Ok((i, Ok(reader))) => readers.push((i, reader)),
-                Ok((i, Err(e))) => warn!(
-                    "Failed to parse extra xmltv ({}): {}",
-                    output_args.extra_xmltv[i], e
-                ),
-                Err(e) => warn!("Task join error parsing extra xmltv: {}", e),
-            }
-        }
-        readers.sort_by_key(|(index, _)| *index);
-        readers.into_iter().map(|(_, reader)| reader).collect()
-    } else {
-        Vec::new()
-    };
-    let xml = get_channels_cached(&state, &output_args, true, &scheme, &host)
+
+    let expected_gen = state.caches.generation();
+    let xml = get_channels_cached(&state, &runtime.effective_args, true)
         .await
         .and_then(|mut ch| {
-            if use_alias_name {
-                let runtime = match state.runtime.read() {
-                    Ok(guard) => guard,
-                    Err(_) => return Err(anyhow!("Config lock poisoned")),
-                };
+            let live = state.runtime();
+            if live.config.xmltv.use_alias_name {
                 for channel in ch.iter_mut() {
-                    let alias = apply_alias(&channel.name, &runtime.config, &runtime.compiled);
+                    let alias = apply_alias(&channel.name, &live.config, &live.compiled);
                     let alias = alias.trim().to_string();
                     if !alias.is_empty() {
                         channel.name = alias;
                     }
                 }
             }
-            to_xmltv(ch, extra_readers)
+            to_xmltv(&ch)
         });
+
     match xml {
         Err(e) => {
-            if let Some(old_xmltv) = state
-                .stale_xmltv
-                .lock()
-                .ok()
-                .and_then(|cache| cache.get(&cache_key).cloned())
-            {
+            if let Some(old_xmltv) = state.caches.get_stale_xmltv(&cache_key) {
                 HttpResponse::Ok().content_type("text/xml").body(old_xmltv)
             } else {
                 HttpResponse::InternalServerError().body(format!("Error getting channels: {}", e))
             }
         }
         Ok(xml) => {
-            put_cached_text(
-                &state.xmltv_cache,
-                cache_key.clone(),
-                xml.clone(),
-                XMLTV_CACHE_TTL,
-            );
-            put_stale_text(&state.stale_xmltv, cache_key, xml.clone());
+            state.caches.put_xmltv(expected_gen, cache_key, xml.clone());
             HttpResponse::Ok().content_type("text/xml").body(xml)
         }
     }
@@ -98,33 +89,45 @@ pub(crate) async fn logo(
     req: HttpRequest,
 ) -> impl Responder {
     debug!("Get logo");
-    match state.runtime.read() {
-        Ok(guard) if !check_auth(&req, &guard.config, "logo") => {
-            return HttpResponse::Unauthorized().body("Unauthorized");
-        }
-        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-        _ => {}
+    let runtime = state.runtime();
+    if !check_auth(&req, &runtime.config, "logo") {
+        return HttpResponse::Unauthorized().body("Unauthorized");
     }
-    let args = match output_effective_args(&state) {
-        Ok(args) => args,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {e}")),
+    let id = path.into_inner();
+    if !is_valid_logo_id(&id) {
+        return HttpResponse::BadRequest().body("Invalid logo id");
+    }
+    let Some(creds) = runtime.effective_args.upstream.as_ref() else {
+        return HttpResponse::NotFound()
+            .body("Channel logos are unavailable in proxy-only mode (no upstream credentials)");
     };
-    match get_icon_cached(&state, &args, &path).await {
+    match get_icon_cached(
+        &state,
+        creds,
+        runtime.effective_args.interface.as_deref(),
+        &id,
+    )
+    .await
+    {
         Ok(icon) => HttpResponse::Ok().content_type("image/png").body(icon),
-        Err(e) => HttpResponse::NotFound().body(format!("Error getting channels: {}", e)),
+        Err(e) => HttpResponse::NotFound().body(format!("Error getting channel logo: {}", e)),
     }
 }
 
 #[get("/playlist")]
 pub(crate) async fn playlist_handler(state: Data<AppState>, req: HttpRequest) -> impl Responder {
     debug!("Get playlist");
-    let need_auth = match state.runtime.read() {
-        Ok(guard) => check_auth(&req, &guard.config, "playlist"),
-        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-    };
-    if !need_auth {
+    let runtime = state.runtime();
+    if !check_auth(&req, &runtime.config, "playlist") {
         return HttpResponse::Unauthorized().body("Unauthorized");
     }
+
+    if runtime.effective_args.upstream.is_none() {
+        return HttpResponse::Ok()
+            .content_type("application/vnd.apple.mpegurl")
+            .body("#EXTM3U\n");
+    }
+
     let scheme = req.connection_info().scheme().to_owned();
     let host = req.connection_info().host().to_owned();
     let user_agent = req
@@ -132,33 +135,28 @@ pub(crate) async fn playlist_handler(state: Data<AppState>, req: HttpRequest) ->
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("Unknown");
-    let is_kodi = user_agent.to_lowercase().contains("kodi");
+    let is_kodi = user_agent.to_ascii_lowercase().contains("kodi");
     let playseek = if is_kodi {
         "{utc:YmdHMS}-{utcend:YmdHMS}"
     } else {
         "${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"
     };
-    let output_args = match output_effective_args(&state) {
-        Ok(args) => args,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("Error: {}", e)),
-    };
+
+    let output_args = &runtime.effective_args;
     let cache_key = format!(
-        "{}|{}|{}|{}",
-        scheme, host, is_kodi, output_args.fcc_enabled
+        "{scheme}|{host}|{is_kodi}|{}|{}|{}",
+        output_args.udp_proxy, output_args.rtsp_proxy, output_args.fcc_enabled
     );
-    if let Some(playlist) = get_cached_text(&state.playlist_cache, &cache_key) {
+    if let Some(playlist) = state.caches.get_playlist(&cache_key) {
         return HttpResponse::Ok()
             .content_type("application/vnd.apple.mpegurl")
             .body(playlist);
     }
-    match get_channels_cached(&state, &output_args, false, &scheme, &host).await {
+
+    let expected_gen = state.caches.generation();
+    match get_channels_cached(&state, output_args, false).await {
         Err(e) => {
-            if let Some(old_playlist) = state
-                .stale_playlists
-                .lock()
-                .ok()
-                .and_then(|cache| cache.get(&cache_key).cloned())
-            {
+            if let Some(old_playlist) = state.caches.get_stale_playlist(&cache_key) {
                 HttpResponse::Ok()
                     .content_type("application/vnd.apple.mpegurl")
                     .body(old_playlist)
@@ -167,46 +165,25 @@ pub(crate) async fn playlist_handler(state: Data<AppState>, req: HttpRequest) ->
             }
         }
         Ok(ch) => {
+            let live = state.runtime();
             let mut entries =
-                build_local_entries(ch, &output_args, &scheme, &host, playseek, 0, None);
-            if !output_args.extra_playlist.is_empty() {
-                let mut index = entries.len();
-                for (source_index, content) in
-                    fetch_extra_playlists(&state.extra_client, &output_args.extra_playlist).await
-                {
-                    let source = format!("extra:{source_index}");
-                    let mut extra_entries = parse_m3u_playlist(&content, &source, index);
-                    index += extra_entries.len();
-                    entries.append(&mut extra_entries);
-                }
-            }
-
-            let runtime = match state.runtime.read() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    return HttpResponse::InternalServerError().body("Config lock poisoned");
-                }
-            };
+                build_local_entries(ch, &live.effective_args, &scheme, &host, playseek, 0, None);
             let ctx = EntryBuildContext {
-                config: &runtime.config,
-                compiled: &runtime.compiled,
+                config: &live.config,
+                compiled: &live.compiled,
             };
-            protect_local_entry_urls(&mut entries, &runtime.config);
+            protect_local_entry_urls(&mut entries, &live.config);
             let entries = finalize_entries(entries, &ctx);
-            let playlist = match render_playlist(&entries, &runtime.templates) {
+            let playlist = match render_playlist(&entries, &live.templates) {
                 Ok(playlist) => playlist,
                 Err(e) => {
                     return HttpResponse::InternalServerError()
                         .body(format!("Template render error: {}", e));
                 }
             };
-            put_cached_text(
-                &state.playlist_cache,
-                cache_key.clone(),
-                playlist.clone(),
-                PLAYLIST_CACHE_TTL,
-            );
-            put_stale_text(&state.stale_playlists, cache_key, playlist.clone());
+            state
+                .caches
+                .put_playlist(expected_gen, cache_key, playlist.clone());
             HttpResponse::Ok()
                 .content_type("application/vnd.apple.mpegurl")
                 .body(playlist)
@@ -220,18 +197,15 @@ pub(crate) async fn rtsp(
     mut params: Query<BTreeMap<String, String>>,
     req: HttpRequest,
 ) -> impl Responder {
-    let effective_args = match state.runtime.read() {
-        Ok(guard) => {
-            if !guard.effective_args.rtsp_proxy {
-                return HttpResponse::NotFound().body("RTSP proxy disabled");
-            }
-            if !check_auth(&req, &guard.config, "rtsp") {
-                return HttpResponse::Unauthorized().body("Unauthorized");
-            }
-            guard.effective_args.clone()
-        }
-        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-    };
+    let runtime = state.runtime();
+    if !runtime.effective_args.rtsp_proxy {
+        return HttpResponse::NotFound().body("RTSP proxy disabled");
+    }
+    if !check_auth(&req, &runtime.config, "rtsp") {
+        return HttpResponse::Unauthorized().body("Unauthorized");
+    }
+    let effective_args = runtime.effective_args.clone();
+
     let path: String = req.match_info().query("tail").into();
     if !params.contains_key("playseek") && params.contains_key("utc") {
         let Some(utc) = params.get("utc") else {
@@ -274,7 +248,9 @@ pub(crate) async fn rtsp(
             pairs.append_pair(key, value);
         }
     }
-    if let Err(error) = state.upstream_auth.ensure_fresh(&effective_args).await {
+    if effective_args.upstream.is_some()
+        && let Err(error) = state.upstream_auth.ensure_fresh(&effective_args).await
+    {
         warn!("Pre-stream upstream authorization refresh failed: {error}");
     }
     let permit = match state.shared_proxy.try_acquire() {
@@ -286,7 +262,7 @@ pub(crate) async fn rtsp(
         Ok(stream) => HttpResponse::Ok()
             .content_type("video/mp2t")
             .streaming(stream),
-        Err(error) if is_rtsp_auth_status(&error) => {
+        Err(error) if is_rtsp_auth_status(&error) && effective_args.upstream.is_some() => {
             warn!("RTSP authorization rejected; refreshing upstream authorization once");
             if let Err(refresh_error) = state.upstream_auth.force_refresh(&effective_args).await {
                 return HttpResponse::BadGateway().body(format!(
@@ -319,34 +295,29 @@ async fn udp_like(
     params: Query<BTreeMap<String, String>>,
     req: HttpRequest,
 ) -> impl Responder {
-    let effective_args = match state.runtime.read() {
-        Ok(guard) => {
-            if !guard.effective_args.udp_proxy {
-                return HttpResponse::NotFound().body("UDP proxy disabled");
-            }
-            if !check_auth(&req, &guard.config, "udp") {
-                return HttpResponse::Unauthorized().body("Unauthorized");
-            }
-            guard.effective_args.clone()
-        }
-        Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-    };
-    let addr = &*addr;
-    let addr = match SocketAddrV4::from_str(addr) {
+    let runtime = state.runtime();
+    if !runtime.effective_args.udp_proxy {
+        return HttpResponse::NotFound().body("UDP proxy disabled");
+    }
+    if !check_auth(&req, &runtime.config, "udp") {
+        return HttpResponse::Unauthorized().body("Unauthorized");
+    }
+    let effective_args = runtime.effective_args.clone();
+
+    let addr = match SocketAddrV4::from_str(&addr) {
         Ok(addr) => addr,
         Err(e) => return HttpResponse::BadRequest().body(format!("Error: {}", e)),
     };
-    if let Err(error) = state.upstream_auth.ensure_fresh(&effective_args).await {
+    if effective_args.upstream.is_some()
+        && let Err(error) = state.upstream_auth.ensure_fresh(&effective_args).await
+    {
         warn!("Pre-stream upstream authorization refresh failed: {error}");
     }
     let fcc = match params.get("fcc") {
         Some(value) => {
             // Read FCC tuning from the live config when a new shared UDP source
             // is created.
-            let fcc_cfg = match state.runtime.read() {
-                Ok(guard) => guard.config.fcc.clone(),
-                Err(_) => return HttpResponse::InternalServerError().body("Config lock poisoned"),
-            };
+            let fcc_cfg = state.runtime().config.fcc.clone();
             match parse_fcc_server(value) {
                 Ok(server) if fcc_cfg.enabled => {
                     debug!(
@@ -398,7 +369,7 @@ async fn udp_like(
             match receiver.recv().await {
                 Ok(bytes) => yield Ok::<Bytes, anyhow::Error>(bytes),
                 Err(SharedProxyRecvError::Lagged(n)) => {
-                    warn!("UDP receiver lagged by {} packets", n);
+                    debug!("UDP receiver lagged by {} packets", n);
                     continue;
                 }
                 Err(SharedProxyRecvError::Closed) => break,

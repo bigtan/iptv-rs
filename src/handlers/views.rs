@@ -1,7 +1,18 @@
-use super::super::*;
+use crate::{BASE_CSS, html_escape, playlist::ChannelEntry};
+
+pub(crate) fn is_safe_stream_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    let Some((scheme, _)) = trimmed.split_once("://") else {
+        return false;
+    };
+    matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http" | "https" | "rtsp" | "rtp" | "udp" | "igmp"
+    )
+}
 
 pub(super) fn render_manage_index(uptime: u64, alias_rules: usize, group_count: usize) -> String {
-    let html = format!(
+    format!(
         r#"<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -112,11 +123,10 @@ pub(super) fn render_manage_index(uptime: u64, alias_rules: usize, group_count: 
         alias_rules = alias_rules,
         group_count = group_count,
         base_css = BASE_CSS,
-    );
-    html
+    )
 }
 
-pub(super) fn render_channels(entries: &[ChannelEntry], limit: Option<usize>) -> String {
+pub(crate) fn render_channels(entries: &[ChannelEntry], limit: Option<usize>) -> String {
     let count = entries.len();
     let limit = limit.unwrap_or(entries.len());
 
@@ -126,20 +136,18 @@ pub(super) fn render_channels(entries: &[ChannelEntry], limit: Option<usize>) ->
         let raw_name = html_escape(&e.raw_name);
         let group = html_escape(&e.group);
         let resolution_label = html_escape(&e.resolution_label);
-        let url = html_escape(&e.url);
+        let display_url = html_escape(&e.url);
+        let href = if is_safe_stream_url(&e.url) {
+            html_escape(e.url.trim())
+        } else {
+            "#".to_string()
+        };
         rows.push_str(&format!(
-            "<tr><td class='fw-bold text-primary'>{}</td><td class='text-muted small'>{}</td><td><span class='badge bg-light text-dark border'>{}</span></td><td><span class='badge bg-info-subtle text-info border border-info-subtle'>{}</span></td><td class='url-cell text-truncate' style='max-width:250px;'><a href='{}' class='text-decoration-none small' title='{}'>{}</a></td></tr>\n",
-            alias_name,
-            raw_name,
-            group,
-            resolution_label,
-            url,
-            url,
-            url,
+            "<tr><td class='fw-bold text-primary'>{alias_name}</td><td class='text-muted small'>{raw_name}</td><td><span class='badge bg-light text-dark border'>{group}</span></td><td><span class='badge bg-info-subtle text-info border border-info-subtle'>{resolution_label}</span></td><td class='url-cell text-truncate' style='max-width:250px;'><a href='{href}' class='text-decoration-none small' title='{display_url}'>{display_url}</a></td></tr>\n",
         ));
     }
 
-    let html = format!(
+    format!(
         r#"<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -230,8 +238,7 @@ pub(super) fn render_channels(entries: &[ChannelEntry], limit: Option<usize>) ->
         count = count,
         limit = limit,
         base_css = BASE_CSS,
-    );
-    html
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -241,8 +248,6 @@ pub(super) fn render_status(
     manage_enabled: &str,
     protected: &str,
     token_set: &str,
-    extra_playlist: usize,
-    extra_xmltv: usize,
     channels_count: usize,
     alias_rules: usize,
     alias_preview: &str,
@@ -250,7 +255,7 @@ pub(super) fn render_status(
     group_count: usize,
     channels_link: &str,
 ) -> String {
-    let html = format!(
+    format!(
         r#"<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -331,20 +336,13 @@ pub(super) fn render_status(
           <div class="card-body">
             <div class="list-group list-group-flush">
               <a href="/playlist" class="list-group-item list-group-item-action d-flex justify-content-between align-items-center px-0 py-3">
-                <div><div class="fw-bold">M3U Playlist</div><div class="small text-muted">Aggregated playlist with alias and sorting</div></div>
+                <div><div class="fw-bold">M3U Playlist</div><div class="small text-muted">Playlist with alias and sorting rules</div></div>
                 <span class="badge bg-primary rounded-pill">/playlist</span>
               </a>
               <a href="/xmltv" class="list-group-item list-group-item-action d-flex justify-content-between align-items-center px-0 py-3">
                 <div><div class="fw-bold">XMLTV EPG</div><div class="small text-muted">Electronic Program Guide data</div></div>
                 <span class="badge bg-primary rounded-pill">/xmltv</span>
               </a>
-              <div class="list-group-item d-flex justify-content-between align-items-center px-0 py-3">
-                <div><div class="fw-bold">Extra Sources</div><div class="small text-muted">Additional M3U/XMLTV from CLI args</div></div>
-                <div>
-                  <span class="badge bg-secondary me-1">{extra_playlist} Playlists</span>
-                  <span class="badge bg-secondary">{extra_xmltv} EPGs</span>
-                </div>
-              </div>
             </div>
           </div>
         </div>
@@ -383,8 +381,6 @@ pub(super) fn render_status(
         manage_enabled = manage_enabled,
         protected = protected,
         token_set = if token_set == "yes" { "Active" } else { "None" },
-        extra_playlist = extra_playlist,
-        extra_xmltv = extra_xmltv,
         channels_count = channels_count,
         alias_rules = alias_rules,
         alias_preview = alias_preview,
@@ -392,6 +388,5 @@ pub(super) fn render_status(
         group_count = group_count,
         channels_link = channels_link,
         base_css = BASE_CSS,
-    );
-    html
+    )
 }
