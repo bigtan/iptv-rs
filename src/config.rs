@@ -413,4 +413,99 @@ mod tests {
         assert_eq!(safe.app.imei.as_deref(), Some("REDACTED"));
         assert_eq!(safe.auth.token, "REDACTED");
     }
+
+    #[test]
+    fn shipped_config_file_parses_and_compiles_cleanly() {
+        let raw = include_str!("../config/iptv.toml");
+        assert!(toml::from_str::<Config>(raw).is_ok());
+        let config: Config = toml::from_str(raw).expect("config/iptv.toml must parse cleanly");
+        compile_config(&config).expect("config/iptv.toml regexes must compile");
+        build_templates(&config).expect("config/iptv.toml templates must compile");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openwrt_init_rendered_toml_parses_against_config() {
+        let out_path =
+            std::env::temp_dir().join(format!("iptv-openwrt-init-{}.toml", rand::random::<u64>()));
+        let script = r#"
+            set -eu
+            eval "$(sed '1d' openwrt/iptv/files/iptv.init)"
+            TOML_CONFIG="$1"
+            config_get() {
+                local var="$1" sec="$2" opt="$3" def="${4:-}"
+                case "$sec:$opt" in
+                    main:bind) eval "$var='[::]:7088'" ;;
+                    main:bind_interface) eval "$var='br-lan'" ;;
+                    main:workers) eval "$var='2'" ;;
+                    main:interface) eval "$var='pppoe-iptv'" ;;
+                    main:alias_mode) eval "$var='first_match'" ;;
+                    main:default_group) eval "$var='未分组'" ;;
+                    main:fcc_max_redirects) eval "$var='5'" ;;
+                    main:fcc_switch_extra_packets) eval "$var='64'" ;;
+                    main:fcc_switch_min_unicast_ms) eval "$var='500'" ;;
+                    r1:type) eval "$var='regex'" ;;
+                    r1:pattern) eval "$var='^CCTV1$'" ;;
+                    r1:replace) eval "$var='CCTV-1'" ;;
+                    res1:pattern) eval "$var='(?i)4k'" ;;
+                    res1:score) eval "$var='400'" ;;
+                    res1:label) eval "$var='R4K'" ;;
+                    g1:group) eval "$var='#IPTV-央视'" ;;
+                    g1:match_regex) eval "$var=''" ;;
+                    *) eval "$var=\"\$def\"" ;;
+                esac
+            }
+            config_get_bool() {
+                local var="$1" sec="$2" opt="$3" def="${4:-0}"
+                case "$sec:$opt" in
+                    main:udp_proxy|main:rtsp_proxy|main:manage_enabled|main:xmltv_use_alias_name) eval "$var='1'" ;;
+                    main:fcc_enabled) eval "$var='0'" ;;
+                    *) eval "$var=\"\$def\"" ;;
+                esac
+            }
+            config_list_foreach() {
+                local sec="$1" opt="$2" cb="$3"
+                case "$sec:$opt" in
+                    main:auth_protect)
+                        for item in playlist xmltv manage rtsp udp logo; do "$cb" "$item"; done ;;
+                    main:same_alias)
+                        for item in resolution_desc prefer_resolution original; do "$cb" "$item"; done ;;
+                    main:prefer_resolution)
+                        for item in R4K Uhd Fhd Hd Sd Unknown; do "$cb" "$item"; done ;;
+                    g1:channels)
+                        for item in CCTV1 CCTV2; do "$cb" "$item"; done ;;
+                esac
+            }
+            config_foreach() {
+                local cb="$1" kind="$2"
+                case "$kind" in
+                    alias_rule) "$cb" r1 ;;
+                    resolution_rule) "$cb" res1 ;;
+                    group) "$cb" g1 ;;
+                esac
+            }
+            generate_toml
+        "#;
+
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg("sh")
+            .arg(&out_path)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .expect("sh should execute");
+        assert!(status.success(), "generate_toml should exit cleanly");
+
+        let rendered = std::fs::read_to_string(&out_path).expect("rendered TOML should exist");
+        let _ = std::fs::remove_file(&out_path);
+
+        let parsed: Config =
+            toml::from_str(&rendered).expect("OpenWrt generated TOML must match Config schema");
+        assert_eq!(parsed.app.bind_interface.as_deref(), Some("br-lan"));
+        assert_eq!(parsed.app.workers, Some(2));
+        assert!(parsed.app.udp_proxy);
+        assert!(parsed.app.rtsp_proxy);
+        compile_config(&parsed).expect("OpenWrt generated TOML rules must compile");
+    }
 }
