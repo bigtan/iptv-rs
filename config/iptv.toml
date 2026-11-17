@@ -1,9 +1,14 @@
 [app]
+# user, passwd, and mac can be omitted when udp_proxy or rtsp_proxy is enabled (proxy-only mode)
 user = "YOUR_USER"
 passwd = "YOUR_PASSWORD"
 mac = "YOUR_MAC"
 interface = "YOUR_INTERFACE"
 bind = "[::]:7088"
+# Restrict HTTP listener socket to a LAN interface on Linux (SO_BINDTODEVICE), e.g. "br-lan" on OpenWrt
+# bind_interface = "br-lan"
+# HTTP worker thread count (defaults to CPU count; 2 is recommended for routers)
+# workers = 2
 rtsp_proxy = true
 udp_proxy = true
 
@@ -137,7 +142,6 @@ channels = ["百视通体育直播室1","百视通体育直播室4","百视通�
 
 [sorting]
 same_alias = ["resolution_desc", "prefer_resolution", "original"]
-source_priority = ["gd-iptv", "extra:0"]
 
 [sorting.prefer_resolution]
 order = ["R4K", "Uhd", "Fhd", "Hd", "Sd", "Unknown"]

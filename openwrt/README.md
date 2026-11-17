@@ -8,8 +8,15 @@ Design goals
 
 - Keep the OpenWrt integration UCI-native: LuCI edits `/etc/config/iptv`.
 - Keep the Rust daemon portable: the init script renders UCI into the existing
-  TOML format at `/var/etc/iptv.toml` before starting the service.
-- Use `procd` for lifecycle, logging, respawn, and UCI reload triggers.
+  TOML format at `/var/etc/iptv.toml` (with `0600` owner-only permissions)
+  before starting or reloading the service.
+- Use `procd` for lifecycle, logging, respawn, and UCI reload triggers, sending
+  hitless `SIGHUP` reloads when listener settings (`bind`, `bind_interface`,
+  `workers`) are unchanged and restarting automatically when they change.
+- Support restricting the HTTP listener to a LAN interface (such as `br-lan`)
+  via `bind_interface` (`SO_BINDTODEVICE`) so `[::]:7088` is not exposed on
+  WAN or `pppoe-iptv` interfaces, as well as standalone UDP/RTSP proxy-only
+  mode without upstream account credentials.
 - Keep the web UI as a modern LuCI JavaScript app with `menu.d` and `rpcd`
   ACL declarations.
 - Install prebuilt musl release binaries so SDK builds do not need to build

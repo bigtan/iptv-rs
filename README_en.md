@@ -5,12 +5,12 @@ English | [简体中文](README.md)
 `iptv-rs` is an independently maintained IPTV proxy written in Rust.
 
 It provides:
-- playlist and XMLTV aggregation
-- UDP multicast proxying
+- playlist and XMLTV generation
+- UDP multicast proxying with shared hub fan-out and fast channel join
 - Telecom FCC bootstrap for `/udp/...?...` streams
 - RTSP replay/live proxying with a native Rust RTSP client
 - alias/group/resolution rules
-- lightweight management endpoints
+- lightweight management endpoints and hitless `SIGHUP` hot reload
 
 ## License
 
@@ -21,23 +21,25 @@ It provides:
 ## Usage
 
 ```text
-Usage: iptv-rs [OPTIONS] --user <USER> --passwd <PASSWD> --mac <MAC>
+Usage: iptv-rs [OPTIONS]
 
 Options:
-  -u, --user <USER>                      Login username (or config [app].user)
-  -p, --passwd <PASSWD>                  Login password (or config [app].passwd)
-  -m, --mac <MAC>                        MAC address (or config [app].mac)
-  -i, --imei <IMEI>                      IMEI (or config [app].imei) [default: ]
-  -b, --bind <BIND>                      Bind address:port (or config [app].bind) [default: 0.0.0.0:7878]
-  -a, --address <ADDRESS>                IP address/interface name (or config [app].address) [default: ]
-  -I, --interface <INTERFACE>            Interface to request (or config [app].interface)
-  -c, --config <CONFIG>                  Config file path (TOML)
-      --extra-playlist <EXTRA_PLAYLIST>  Url to extra m3u
-      --extra-xmltv <EXTRA_XMLTV>        Url to extra xmltv
-      --udp-proxy                        Use UDP proxy
-      --rtsp-proxy                       Use rtsp proxy
-  -h, --help                             Print help
+  -u, --user <USER>                        Login username (or config [app].user; optional in proxy-only mode)
+  -p, --passwd <PASSWD>                    Login password (or config [app].passwd; optional in proxy-only mode)
+  -m, --mac <MAC>                          MAC address (or config [app].mac; optional in proxy-only mode)
+  -i, --imei <IMEI>                        IMEI (or config [app].imei) [default: ]
+  -b, --bind <BIND>                        Bind address:port (or config [app].bind) [default: 0.0.0.0:7878]
+      --bind-interface <BIND_INTERFACE>    Bind HTTP listener to interface via SO_BINDTODEVICE (or config [app].bind_interface)
+      --workers <WORKERS>                  HTTP worker thread count (or config [app].workers)
+  -a, --address <ADDRESS>                  IP address/interface name (or config [app].address) [default: ]
+  -I, --interface <INTERFACE>              Interface to request (or config [app].interface)
+  -c, --config <CONFIG>                    Config file path (TOML)
+      --udp-proxy                          Use UDP proxy
+      --rtsp-proxy                         Use rtsp proxy
+  -h, --help                               Print help
 ```
+
+When `--udp-proxy` or `--rtsp-proxy` is enabled, `--user`, `--passwd`, and `--mac` are optional so `iptv-rs` can run in standalone proxy-only mode without upstream EPG credentials.
 
 ## Configuration
 
@@ -47,16 +49,19 @@ Example file:
 - [config/iptv.toml](config/iptv.toml)
 
 Key sections:
-- `[app]`: login, bind address, proxy switches
-- `[auth]`: token protection, including optional `rtsp`, `udp`, and `logo` protection
+- `[app]`: login (optional in proxy-only mode), bind address (`bind`), HTTP listener interface (`bind_interface`, recommended `"br-lan"` on Linux/OpenWrt via `SO_BINDTODEVICE` so `[::]:7088` is not exposed on `pppoe-iptv` or WAN IPv6), HTTP worker count (`workers`, e.g. `2` on routers), and proxy switches
+- `[auth]`: token protection, defaulting to protecting `playlist`, `xmltv`, `manage`, `rtsp`, `udp`, and `logo` when `auth.token` is set
 - `[fcc]`: FCC enablement and timeout tuning
-  Uses RTP sequence numbers for multicast switchover, with a minimum unicast play time before switching.
+  Uses RTP sequence numbers for multicast switchover, waiting `switch_min_unicast_ms` before sending `FCC_TERM` and performing seamless overlap handoff.
 - `[alias]`: alias rewrite rules
 - `[resolution]`: quality scoring rules
 - `[groups]`: channel grouping
+- `[sorting]`: same-alias resolution sorting rules
 - `[template]`: playlist rendering templates
 - `[xmltv]`: XMLTV naming behavior
 - `[manage]`: management endpoint enablement
+
+Hot reload: on Unix/Linux, sending `SIGHUP` (or calling `POST /manage/reload`) reloads the configuration file and clears caches hitlessly without dropping active UDP/RTSP streams (changing listener parameters `bind`, `bind_interface`, or `workers` requires a full process restart).
 
 ## Endpoints
 
@@ -114,12 +119,6 @@ cargo install cargo-cross
 cargo cross build --release --target x86_64-unknown-linux-musl
 ```
 
-TLS feature selection:
-
-- Rustls is enabled by default so HTTPS extra playlists/XMLTV work in release builds
-- `--no-default-features --features tls` for native TLS/OpenSSL
-- `--no-default-features` for an HTTP-only minimal build
-
 ## OpenWrt Integration
 
 This repository provides native OpenWrt package definitions under [openwrt/](openwrt):
@@ -129,7 +128,7 @@ This repository provides native OpenWrt package definitions under [openwrt/](ope
 
 ### Service Management and UCI Configuration
 
-Service lifecycle is managed by OpenWrt's `procd`. Configuration is stored in `/etc/config/iptv`. Upon starting, the init script renders UCI settings into `/var/etc/iptv.toml` before launching the daemon.
+Service lifecycle is managed by OpenWrt's `procd`. Configuration is stored in `/etc/config/iptv`. When starting or reloading, the init script renders UCI settings into `/var/etc/iptv.toml` with owner-only (`0600`) permissions. When `bind`, `bind_interface`, and `workers` are unchanged, `/etc/init.d/iptv reload` (including LuCI Save & Apply) sends `SIGHUP` for hitless hot reload without dropping active streams.
 
 Common service commands:
 
@@ -138,15 +137,16 @@ Common service commands:
 /etc/init.d/iptv enable
 /etc/init.d/iptv start
 
-# Check status or reload configuration
+# Check status or hitlessly reload configuration
 /etc/init.d/iptv status
 /etc/init.d/iptv reload
 ```
 
-Example configuration via UCI CLI:
+Example configuration via UCI CLI (setting `bind_interface='br-lan'` is recommended on standard OpenWrt routers to restrict HTTP listening to LAN):
 
 ```sh
 uci set iptv.main.enabled='1'
+uci set iptv.main.bind_interface='br-lan'
 uci set iptv.main.user='YOUR_USER'
 uci set iptv.main.passwd='YOUR_PASSWORD'
 uci set iptv.main.mac='YOUR_MAC'

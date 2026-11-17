@@ -50,7 +50,25 @@ write_option_number() {
 	local value
 
 	config_get value "$section" "$option" "$default"
+	case "$value" in
+		''|*[!0-9]*) value="$default" ;;
+	esac
 	printf '%s = %s\n' "$key" "${value:-$default}"
+}
+
+write_option_optional_uint() {
+	local section="$1"
+	local option="$2"
+	local key="${3:-$2}"
+	local value
+
+	config_get value "$section" "$option" ""
+	case "$value" in
+		''|*[!0-9]*) return 0 ;;
+	esac
+	value="${value#"${value%%[!0]*}"}"
+	[ -n "$value" ] || return 0
+	printf '%s = %s\n' "$key" "$value"
 }
 
 _array_items=""
@@ -135,63 +153,78 @@ generate_toml() {
 	local alias_mode default_group
 
 	mkdir -p "$(dirname "$TOML_CONFIG")"
-	{
-		printf '[app]\n'
-		write_option_string main user
-		write_option_string main passwd
-		write_option_string main mac
-		write_option_string main imei
-		write_option_string main bind
-		write_option_string main address
-		write_option_string main interface
-		write_option_bool main udp_proxy
-		write_option_bool main rtsp_proxy
+	(
+		umask 077
+		{
+			printf '[app]\n'
+			write_option_string main user
+			write_option_string main passwd
+			write_option_string main mac
+			write_option_string main imei
+			write_option_string main bind
+			write_option_string main bind_interface
+			write_option_optional_uint main workers
+			write_option_string main address
+			write_option_string main interface
+			write_option_bool main udp_proxy
+			write_option_bool main rtsp_proxy
 
-		printf '\n[auth]\n'
-		write_option_string main auth_token token
-		write_list_array main auth_protect protect
+			printf '\n[auth]\n'
+			write_option_string main auth_token token
+			write_list_array main auth_protect protect
 
-		printf '\n[manage]\n'
-		write_option_bool main manage_enabled enabled
+			printf '\n[manage]\n'
+			write_option_bool main manage_enabled enabled
 
-		printf '\n[fcc]\n'
-		write_option_bool main fcc_enabled enabled
-		write_option_number main fcc_max_redirects max_redirects 5
-		write_option_number main fcc_switch_extra_packets switch_extra_packets 64
-		write_option_number main fcc_switch_min_unicast_ms switch_min_unicast_ms 500
+			printf '\n[fcc]\n'
+			write_option_bool main fcc_enabled enabled
+			write_option_number main fcc_max_redirects max_redirects 5
+			write_option_number main fcc_switch_extra_packets switch_extra_packets 64
+			write_option_number main fcc_switch_min_unicast_ms switch_min_unicast_ms 500
 
-		config_get alias_mode main alias_mode "first_match"
-		printf '\n[alias]\nmode = '
-		toml_string "$alias_mode"
-		printf '\n'
-		config_foreach write_alias_rule alias_rule
+			config_get alias_mode main alias_mode "first_match"
+			printf '\n[alias]\nmode = '
+			toml_string "$alias_mode"
+			printf '\n'
+			config_foreach write_alias_rule alias_rule
 
-		printf '\n[resolution]\ndefault_score = 0\n'
-		config_foreach write_resolution_rule resolution_rule
+			printf '\n[resolution]\ndefault_score = 0\n'
+			config_foreach write_resolution_rule resolution_rule
 
-		config_get default_group main default_group "未分组"
-		printf '\n[groups]\ndefault_group = '
-		toml_string "$default_group"
-		printf '\n'
-		config_foreach write_group_entry group
+			config_get default_group main default_group "未分组"
+			printf '\n[groups]\ndefault_group = '
+			toml_string "$default_group"
+			printf '\n'
+			config_foreach write_group_entry group
 
-		printf '\n[sorting]\n'
-		write_list_array main same_alias same_alias
-		write_list_array main source_priority source_priority
-		printf '\n[sorting.prefer_resolution]\n'
-		write_list_array main prefer_resolution order
+			printf '\n[sorting]\n'
+			write_list_array main same_alias same_alias
+			printf '\n[sorting.prefer_resolution]\n'
+			write_list_array main prefer_resolution order
 
-		printf '\n[xmltv]\n'
-		write_option_bool main xmltv_use_alias_name use_alias_name
-	} > "$TOML_CONFIG"
+			printf '\n[xmltv]\n'
+			write_option_bool main xmltv_use_alias_name use_alias_name
+		} > "$TOML_CONFIG"
+	)
+	chmod 600 "$TOML_CONFIG"
 }
 
-append_extra_playlist() {
-	[ -n "$1" ] && procd_append_param command --extra-playlist "$1"
+toml_listener_signature() {
+	local file="$1"
+	[ -f "$file" ] || return 1
+	sed -n '/^\[app\]$/,/^\[/{
+		/^bind[[:space:]]*=/p
+		/^bind_interface[[:space:]]*=/p
+		/^workers[[:space:]]*=/p
+	}' "$file"
 }
 
-append_extra_xmltv() {
-	[ -n "$1" ] && procd_append_param command --extra-xmltv "$1"
+service_is_running() {
+	if type procd_running >/dev/null 2>&1; then
+		procd_running "$CONFIG_NAME"
+		return $?
+	fi
+	ubus call service list "{\"name\":\"$CONFIG_NAME\"}" 2>/dev/null | grep -q '"running":[[:space:]]*true'
 }
 
 start_service() {
@@ -205,8 +238,8 @@ start_service() {
 
 	procd_open_instance
 	procd_set_param command /usr/bin/iptv-rs -c "$TOML_CONFIG"
-	config_list_foreach main extra_playlist append_extra_playlist
-	config_list_foreach main extra_xmltv append_extra_xmltv
+	procd_set_param file "$TOML_CONFIG"
+	procd_set_param reload_signal HUP
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_set_param respawn 3600 5 5
@@ -214,6 +247,28 @@ start_service() {
 }
 
 reload_service() {
+	local enabled old_listener new_listener had_toml=0
+
+	config_load "$CONFIG_NAME"
+	config_get_bool enabled main enabled 0
+	if [ "$enabled" != "1" ]; then
+		stop
+		return 0
+	fi
+
+	if [ -f "$TOML_CONFIG" ]; then
+		had_toml=1
+		old_listener="$(toml_listener_signature "$TOML_CONFIG")"
+	fi
+
+	if [ "$had_toml" = "1" ] && service_is_running; then
+		generate_toml
+		new_listener="$(toml_listener_signature "$TOML_CONFIG")"
+		if [ "$old_listener" = "$new_listener" ]; then
+			procd_send_signal "$CONFIG_NAME" '*' HUP && return 0
+		fi
+	fi
+
 	stop
 	start
 }

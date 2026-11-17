@@ -30,11 +30,10 @@ define Package/iptv
   CATEGORY:=Network
   TITLE:=Rust IPTV proxy with RTSP replay and multicast proxy support
   URL:=https://github.com/bigtan/iptv-rs
-  DEPENDS:=+ca-bundle
 endef
 
 define Package/iptv/description
-  iptv-rs is an IPTV proxy with playlist/XMLTV aggregation, UDP multicast
+  iptv-rs is an IPTV proxy with playlist/XMLTV generation, UDP multicast
   proxying, Telecom FCC bootstrap support, RTSP replay, and management
   endpoints.
 endef

@@ -72,6 +72,17 @@ return L.view.extend({
 		o = s.option(form.Value, 'bind', _('Bind address'));
 		o.placeholder = '[::]:7088';
 
+		o = s.option(form.Value, 'bind_interface', _('Bind interface'));
+		o.placeholder = 'br-lan';
+		o.rmempty = true;
+		o.description = _('Restrict HTTP listening to a LAN interface (such as br-lan) via SO_BINDTODEVICE to prevent exposure on WAN or IPTV interfaces.');
+
+		o = s.option(form.Value, 'workers', _('Worker threads'));
+		o.datatype = 'min(1)';
+		o.placeholder = '2';
+		o.rmempty = true;
+		o.description = _('HTTP server worker thread count. Defaults to CPU core count when empty.');
+
 		o = s.option(form.Value, 'interface', _('IPTV interface'));
 		o.placeholder = 'pppoe-iptv';
 
@@ -88,17 +99,18 @@ return L.view.extend({
 
 		s = m.section(form.NamedSection, 'main', 'service', _('Account'));
 		s.anonymous = true;
+		s.description = _('Upstream IPTV account credentials. Leave User, Password, and MAC empty to run in standalone UDP/RTSP proxy-only mode.');
 
 		o = s.option(form.Value, 'user', _('User'));
-		o.rmempty = false;
+		o.rmempty = true;
 
 		o = s.option(form.Value, 'passwd', _('Password'));
 		o.password = true;
-		o.rmempty = false;
+		o.rmempty = true;
 
 		o = s.option(form.Value, 'mac', _('MAC address'));
 		o.placeholder = '00:11:22:33:44:55';
-		o.rmempty = false;
+		o.rmempty = true;
 
 		o = s.option(form.Value, 'imei', _('IMEI'));
 
@@ -135,16 +147,7 @@ return L.view.extend({
 		o = s.option(form.Value, 'fcc_switch_min_unicast_ms', _('Minimum unicast time'));
 		o.datatype = 'uinteger';
 		o.placeholder = '500';
-		o.description = _('Minimum FCC unicast playback time before an overlap handoff. Stall and deadline fallbacks may switch earlier to avoid buffering freezes.');
-
-		s = m.section(form.NamedSection, 'main', 'service', _('Extra sources'));
-		s.anonymous = true;
-
-		o = s.option(form.DynamicList, 'extra_playlist', _('Extra playlists'));
-		o.datatype = 'url';
-
-		o = s.option(form.DynamicList, 'extra_xmltv', _('Extra XMLTV'));
-		o.datatype = 'url';
+		o.description = _('Minimum FCC unicast duration (ms) that FCC_TERM and overlap handoff wait before seamlessly switching to multicast. Stall, buffer-cap, and deadline fallbacks may switch earlier if needed.');
 
 		s = m.section(form.NamedSection, 'main', 'service', _('Playlist rules'));
 		s.anonymous = true;
@@ -158,14 +161,10 @@ return L.view.extend({
 		o = s.option(form.DynamicList, 'same_alias', _('Same alias sort order'));
 		o.value('resolution_desc', _('Resolution score'));
 		o.value('prefer_resolution', _('Preferred labels'));
-		o.value('source_priority', _('Source priority'));
 		o.value('original', _('Original order'));
 
 		o = s.option(form.DynamicList, 'prefer_resolution', _('Preferred resolution labels'));
 		o.placeholder = 'R4K Uhd Fhd Hd Sd Unknown';
-
-		o = s.option(form.DynamicList, 'source_priority', _('Source priority'));
-		o.placeholder = 'gd-iptv extra:0';
 
 		o = s.option(form.Flag, 'xmltv_use_alias_name', _('Use alias names in XMLTV'));
 		o.rmempty = false;

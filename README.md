@@ -5,12 +5,12 @@
 `iptv-rs` 是一个使用 Rust 编写的、独立维护的 IPTV 代理服务。
 
 它提供：
-- 播放列表（M3U）与 XMLTV 节目单聚合
-- UDP 组播代理
+- 播放列表（M3U）与 XMLTV 节目单生成
+- UDP 组播代理（多客户端共享组播流与快速进台）
 - 针对 `/udp/...?...` 直播流的电信 FCC 快速切台引导支持
 - 基于原生 Rust RTSP 客户端的 RTSP 回看/时移与直播代理
 - 频道别名、分组与画质优选规则
-- 轻量级管理端点
+- 轻量级管理端点与 `SIGHUP` 无感热重载
 
 ## 许可证
 
@@ -21,23 +21,25 @@
 ## 使用方法
 
 ```text
-Usage: iptv-rs [OPTIONS] --user <USER> --passwd <PASSWD> --mac <MAC>
+Usage: iptv-rs [OPTIONS]
 
 Options:
-  -u, --user <USER>                      Login username (or config [app].user)
-  -p, --passwd <PASSWD>                  Login password (or config [app].passwd)
-  -m, --mac <MAC>                        MAC address (or config [app].mac)
-  -i, --imei <IMEI>                      IMEI (or config [app].imei) [default: ]
-  -b, --bind <BIND>                      Bind address:port (or config [app].bind) [default: 0.0.0.0:7878]
-  -a, --address <ADDRESS>                IP address/interface name (or config [app].address) [default: ]
-  -I, --interface <INTERFACE>            Interface to request (or config [app].interface)
-  -c, --config <CONFIG>                  Config file path (TOML)
-      --extra-playlist <EXTRA_PLAYLIST>  Url to extra m3u
-      --extra-xmltv <EXTRA_XMLTV>        Url to extra xmltv
-      --udp-proxy                        Use UDP proxy
-      --rtsp-proxy                       Use rtsp proxy
-  -h, --help                             Print help
+  -u, --user <USER>                        Login username (or config [app].user; optional in proxy-only mode)
+  -p, --passwd <PASSWD>                    Login password (or config [app].passwd; optional in proxy-only mode)
+  -m, --mac <MAC>                          MAC address (or config [app].mac; optional in proxy-only mode)
+  -i, --imei <IMEI>                        IMEI (or config [app].imei) [default: ]
+  -b, --bind <BIND>                        Bind address:port (or config [app].bind) [default: 0.0.0.0:7878]
+      --bind-interface <BIND_INTERFACE>    Bind HTTP listener to interface via SO_BINDTODEVICE (or config [app].bind_interface)
+      --workers <WORKERS>                  HTTP worker thread count (or config [app].workers)
+  -a, --address <ADDRESS>                  IP address/interface name (or config [app].address) [default: ]
+  -I, --interface <INTERFACE>              Interface to request (or config [app].interface)
+  -c, --config <CONFIG>                    Config file path (TOML)
+      --udp-proxy                          Use UDP proxy
+      --rtsp-proxy                         Use rtsp proxy
+  -h, --help                               Print help
 ```
+
+当启用 `--udp-proxy` 或 `--rtsp-proxy` 时，`--user`、`--passwd`、`--mac` 均可省略，以独立代理模式（proxy-only）运行，无需登录上游 EPG。
 
 ## 配置
 
@@ -47,16 +49,19 @@ Options:
 - [config/iptv.toml](config/iptv.toml)
 
 主要配置节：
-- `[app]`: 登录信息、监听地址、代理开关
-- `[auth]`: Token 鉴权保护配置，支持可选的 `rtsp`、`udp` 和 `logo` 保护
+- `[app]`: 登录信息（纯代理模式下可选）、监听地址（`bind`）、监听网卡绑定（`bind_interface`，在 Linux/OpenWrt 上推荐设为 `"br-lan"`，通过 `SO_BINDTODEVICE` 防止 `[::]:7088` 暴露到 `pppoe-iptv` 或 WAN IPv6）、工作线程数（`workers`，路由器推荐设为 `2`）及代理开关
+- `[auth]`: Token 鉴权保护配置，启用 `token` 时默认保护 `playlist`、`xmltv`、`manage`、`rtsp`、`udp` 和 `logo`
 - `[fcc]`: FCC 功能开启与超时参数调优
-  基于 RTP 序列号平滑切换至组播，并在切换前保持单播播放最小等待时间。
+  基于 RTP 序列号平滑切换至组播，并在发送 `FCC_TERM` 及重叠切流前等待最小单播播放时长（`switch_min_unicast_ms`）。
 - `[alias]`: 频道别名重写规则
 - `[resolution]`: 画质评分与优选规则
 - `[groups]`: 频道分组
+- `[sorting]`: 同名频道画质排序规则
 - `[template]`: 播放列表渲染模板
 - `[xmltv]`: XMLTV 命名行为
 - `[manage]`: 管理端点开启控制
+
+热重载支持：在 Unix/Linux 系统上向进程发送 `SIGHUP`（或请求 `POST /manage/reload`），即可在不中断当前活跃 UDP/RTSP 播放流的情况下重新加载配置文件并刷新缓存（修改 `bind`、`bind_interface` 或 `workers` 等监听参数时需重启进程）。
 
 ## 接口端点
 
@@ -106,12 +111,6 @@ cargo install cargo-cross
 cargo cross build --release --target x86_64-unknown-linux-musl
 ```
 
-TLS 特性选择：
-
-- 默认启用 Rustls，以便在 release 构建中支持通过 HTTPS 获取额外的播放列表与 XMLTV
-- `--no-default-features --features tls` 使用系统原生 TLS / OpenSSL
-- `--no-default-features` 构建仅支持 HTTP 的极简版本
-
 ## OpenWrt 支持
 
 本项目提供了面向 OpenWrt 的完整集成支持，定义文件位于 [openwrt/](openwrt) 目录：
@@ -121,7 +120,7 @@ TLS 特性选择：
 
 ### 服务管理与 UCI 配置
 
-服务生命周期由 OpenWrt 的 `procd` 进行托管，配置项保存在 `/etc/config/iptv`。服务启动时，init 脚本会自动将 UCI 配置转换为 `/var/etc/iptv.toml` 并拉起进程。
+服务生命周期由 OpenWrt 的 `procd` 进行托管，配置项保存在 `/etc/config/iptv`。服务启动或重载时，init 脚本会自动将 UCI 配置转换为仅属主可读（`0600`）的 `/var/etc/iptv.toml`。当 `bind`、`bind_interface`、`workers` 未发生改变时，`/etc/init.d/iptv reload`（及 LuCI 保存应用）会通过 `SIGHUP` 进行无感热重载，不会中断正在播放的流。
 
 基本服务管理命令：
 
@@ -130,15 +129,16 @@ TLS 特性选择：
 /etc/init.d/iptv enable
 /etc/init.d/iptv start
 
-# 检查运行状态或重新加载配置
+# 检查运行状态或无感热重载配置
 /etc/init.d/iptv status
 /etc/init.d/iptv reload
 ```
 
-通过 UCI 命令行配置示例：
+通过 UCI 命令行配置示例（推荐在标准 OpenWrt 路由器上将 `bind_interface` 设为 `br-lan`，仅在局域网监听）：
 
 ```sh
 uci set iptv.main.enabled='1'
+uci set iptv.main.bind_interface='br-lan'
 uci set iptv.main.user='YOUR_USER'
 uci set iptv.main.passwd='YOUR_PASSWORD'
 uci set iptv.main.mac='YOUR_MAC'
