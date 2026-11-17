@@ -112,11 +112,12 @@ cargo build --release
 Release builds optimize the media forwarding hot path for throughput. If binary
 size matters more than CPU usage, use `cargo build --profile release-small`.
 
-Cross build:
+Cross build (pure Rust, using the official toolchain + `rust-lld`):
 
 ```bash
-cargo install cargo-cross
-cargo cross build --release --target x86_64-unknown-linux-musl
+rustup target add aarch64-unknown-linux-musl
+RUSTFLAGS="-C linker-flavor=ld.lld -C linker=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/^host:/{print $2}')/bin/rust-lld" \
+  cargo build --release --target aarch64-unknown-linux-musl
 ```
 
 ## OpenWrt Integration

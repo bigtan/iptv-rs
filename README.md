@@ -104,11 +104,12 @@ cargo build --release
 
 Release 构建针对媒体转发热路径进行了吞吐量优化。如果相较于 CPU 占用更看重二进制体积，可以使用 `cargo build --profile release-small`。
 
-交叉编译：
+交叉编译（无 C 依赖，直接使用官方工具链 + `rust-lld`）：
 
 ```bash
-cargo install cargo-cross
-cargo cross build --release --target x86_64-unknown-linux-musl
+rustup target add aarch64-unknown-linux-musl
+RUSTFLAGS="-C linker-flavor=ld.lld -C linker=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | awk '/^host:/{print $2}')/bin/rust-lld" \
+  cargo build --release --target aarch64-unknown-linux-musl
 ```
 
 ## OpenWrt 支持
