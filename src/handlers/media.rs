@@ -261,6 +261,7 @@ pub(crate) async fn rtsp(
     match proxy::rtsp_source(target_url.clone(), effective_args.interface.clone(), permit).await {
         Ok(stream) => HttpResponse::Ok()
             .content_type("video/mp2t")
+            .insert_header((header::CACHE_CONTROL, "no-cache"))
             .streaming(stream),
         Err(error) if is_rtsp_auth_status(&error) && effective_args.upstream.is_some() => {
             warn!("RTSP authorization rejected; refreshing upstream authorization once");
@@ -279,6 +280,7 @@ pub(crate) async fn rtsp(
             match proxy::rtsp_source(target_url, effective_args.interface, permit).await {
                 Ok(stream) => HttpResponse::Ok()
                     .content_type("video/mp2t")
+                    .insert_header((header::CACHE_CONTROL, "no-cache"))
                     .streaming(stream),
                 Err(retry_error) => HttpResponse::BadGateway().body(format!(
                     "RTSP setup failed after authorization refresh: {retry_error}"
@@ -364,18 +366,21 @@ async fn udp_like(
             return HttpResponse::InternalServerError().body("Shared proxy lock poisoned");
         }
     };
-    HttpResponse::Ok().streaming(stream! {
-        loop {
-            match receiver.recv().await {
-                Ok(bytes) => yield Ok::<Bytes, anyhow::Error>(bytes),
-                Err(SharedProxyRecvError::Lagged(n)) => {
-                    debug!("UDP receiver lagged by {} packets", n);
-                    continue;
+    HttpResponse::Ok()
+        .content_type("video/mp2t")
+        .insert_header((header::CACHE_CONTROL, "no-cache"))
+        .streaming(stream! {
+            loop {
+                match receiver.recv().await {
+                    Ok(bytes) => yield Ok::<Bytes, anyhow::Error>(bytes),
+                    Err(SharedProxyRecvError::Lagged(n)) => {
+                        warn!("UDP receiver lagged by {} chunks", n);
+                        continue;
+                    }
+                    Err(SharedProxyRecvError::Closed) => break,
                 }
-                Err(SharedProxyRecvError::Closed) => break,
             }
-        }
-    })
+        })
 }
 
 #[get("/udp/{addr}")]
@@ -396,4 +401,91 @@ pub(crate) async fn rtp(
     req: HttpRequest,
 ) -> impl Responder {
     udp_like(state, addr, params, req).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        RuntimeConfig,
+        args::Args,
+        build_effective_args,
+        cache::CacheStore,
+        config::{Config, build_templates, compile_config},
+        shared_proxy::SharedProxyRegistry,
+        upstream_auth::UpstreamAuthManager,
+    };
+    use actix_web::{App, http::StatusCode, test as actix_test};
+    use std::sync::{Arc, RwLock};
+
+    fn proxy_only_state() -> Data<AppState> {
+        let cli_args = Args {
+            user: None,
+            passwd: None,
+            mac: None,
+            imei: None,
+            bind: None,
+            bind_interface: None,
+            workers: None,
+            address: None,
+            interface: None,
+            config: None,
+            udp_proxy: false,
+            rtsp_proxy: false,
+        };
+        let mut config = Config::default();
+        config.app.udp_proxy = true;
+        config.auth.token.clear();
+
+        let compiled = compile_config(&config).unwrap();
+        let templates = build_templates(&config).unwrap();
+        let effective_args = build_effective_args(&cli_args, &config).unwrap();
+        assert!(effective_args.upstream.is_none());
+        assert!(effective_args.udp_proxy);
+
+        Data::new(AppState {
+            cli_args,
+            config_path: None,
+            shared_proxy: SharedProxyRegistry::new(),
+            caches: CacheStore::new(),
+            upstream_auth: Arc::new(UpstreamAuthManager::default()),
+            runtime: RwLock::new(Arc::new(RuntimeConfig {
+                config,
+                compiled,
+                templates,
+                effective_args,
+            })),
+        })
+    }
+
+    #[actix_web::test]
+    async fn udp_and_rtp_return_mpegts_no_cache_headers() {
+        let state = proxy_only_state();
+        let app =
+            actix_test::init_service(App::new().service(udp).service(rtp).app_data(state)).await;
+
+        for uri in ["/udp/239.255.0.1:5146", "/rtp/239.255.0.2:5146"] {
+            let resp = actix_test::call_service(
+                &app,
+                actix_test::TestRequest::get().uri(uri).to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "unexpected status for {uri}");
+            assert_eq!(
+                resp.headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("video/mp2t"),
+                "unexpected Content-Type for {uri}"
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-cache"),
+                "unexpected Cache-Control for {uri}"
+            );
+            drop(resp);
+        }
+    }
 }
