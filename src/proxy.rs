@@ -30,6 +30,7 @@ const FCC_REQUEST_RETRY_TIMEOUT: Duration = Duration::from_millis(50);
 const FCC_MAX_REQUEST_RETRIES: usize = 2;
 const FCC_UNICAST_PENDING_TIMEOUT: Duration = Duration::from_millis(250);
 const FCC_UNICAST_IDLE_TIMEOUT: Duration = Duration::from_millis(1000);
+const FCC_SWITCH_DEADLINE: Duration = Duration::from_millis(2000);
 const FCC_ARMED_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// After a switchover is armed, hand off if the FCC unicast has produced no
 /// packet for this long. The telecom server typically stops the unicast burst
@@ -181,9 +182,10 @@ fn should_ignore_fcc_peer(
 }
 
 /// Decide whether to hand off from FCC unicast to multicast now, returning the
-/// reason. The seamless point is when the unicast has reached the head of the
-/// buffered multicast (`overlap`) and `min_unicast_ms` has been satisfied.
-/// `buffer_cap`/`stall`/`deadline` are anti-freeze fallbacks.
+/// reason. Once multicast has started arriving (`first_mcast_seq` is `Some`,
+/// which only happens after `FMT=4 Sync`), `overlap` fires immediately when the
+/// unicast has reached the head of the buffered multicast without gating on
+/// `min_unicast_ms`. `buffer_cap`/`stall`/`deadline` are anti-freeze fallbacks.
 fn fcc_switch_reason(
     unicast_seq: Option<u16>,
     first_mcast_seq: Option<u16>,
@@ -201,7 +203,6 @@ fn fcc_switch_reason(
     let min_ok = min_unicast_satisfied(unicast_started_at, min_unicast_ms);
     if let Some(u_seq) = unicast_seq
         && seq_at_or_after(u_seq, first)
-        && min_ok
     {
         return Some("overlap");
     }
@@ -217,7 +218,7 @@ fn fcc_switch_reason(
         return Some("stall");
     }
     if (min_ok || unicast_started_at.is_none())
-        && switch_armed_at.is_some_and(|t| t.elapsed() >= FCC_UNICAST_IDLE_TIMEOUT)
+        && switch_armed_at.is_some_and(|t| t.elapsed() >= FCC_SWITCH_DEADLINE)
     {
         return Some("deadline");
     }
@@ -767,10 +768,6 @@ pub(crate) fn udp_source(
                                         }
                                     }
 
-                                    handoff
-                                        .maybe_send_termination(&socket, multi_addr, server, &fcc)
-                                        .await;
-
                                     // Both sockets idle. If a switchover is armed, hand off
                                     // through the unified flush below (do NOT take the socket
                                     // without flushing — that would strand pending multicast
@@ -788,6 +785,11 @@ pub(crate) fn udp_source(
                                         transition_complete = true;
                                         break;
                                     }
+
+                                    handoff
+                                        .maybe_send_termination(&socket, multi_addr, server, &fcc)
+                                        .await;
+
                                     info!(
                                         target: "iptv::fcc",
                                         "fcc timeout state={:?} multicast={} server={}, fallback to multicast",
@@ -824,13 +826,9 @@ pub(crate) fn udp_source(
                                     pending_multicast
                                         .push_back((next, Bytes::copy_from_slice(&packet[range])));
 
-                                    handoff
-                                        .maybe_send_termination(&socket, multi_addr, server, &fcc)
-                                        .await;
-
                                     // Multicast packets keep arriving every few ms, so this is
-                                    // where overlap (once min_unicast_ms elapses), buffer_cap,
-                                    // and time-based stall/deadline fallbacks fire promptly.
+                                    // where immediate overlap, buffer_cap, and time-based
+                                    // stall/deadline fallbacks fire promptly.
                                     if let Some(reason) = fcc_switch_reason(
                                         seq.current(),
                                         handoff.first_mcast_seq,
@@ -854,6 +852,10 @@ pub(crate) fn udp_source(
                                         transition_complete = true;
                                         break;
                                     }
+
+                                    handoff
+                                        .maybe_send_termination(&socket, multi_addr, server, &fcc)
+                                        .await;
                                 }
                                 continue;
                             }
@@ -1075,27 +1077,23 @@ pub(crate) fn udp_source(
 
                             if let Some((next, range)) = parse_mpegts_rtp(packet) {
                                 let now = tokio::time::Instant::now();
-                                handoff.last_unicast_at = Some(now);
-                                if state != FccState::UnicastActive {
-                                    info!(
-                                        target: "iptv::fcc",
-                                        "fcc unicast stream started multicast={} server={} first_seq={}",
-                                        multi_addr,
-                                        server,
-                                        next
-                                    );
-                                    handoff.unicast_started_at = Some(now);
-                                }
-                                state = FccState::UnicastActive;
                                 if seq.accept(next) {
+                                    if state != FccState::UnicastActive {
+                                        info!(
+                                            target: "iptv::fcc",
+                                            "fcc unicast stream started multicast={} server={} first_seq={}",
+                                            multi_addr,
+                                            server,
+                                            next
+                                        );
+                                        handoff.unicast_started_at = Some(now);
+                                    }
+                                    state = FccState::UnicastActive;
+                                    handoff.last_unicast_at = Some(now);
                                     yield Ok(Bytes::copy_from_slice(&packet[range]));
                                 }
 
-                                handoff
-                                    .maybe_send_termination(&socket, multi_addr, server, &fcc)
-                                    .await;
-
-                                // Seamless point: once min_unicast_ms is satisfied and unicast
+                                // Seamless point: once multicast has arrived and unicast
                                 // reaches the head of buffered multicast, hand off immediately.
                                 if let Some(reason) = fcc_switch_reason(
                                     seq.current(),
@@ -1119,6 +1117,10 @@ pub(crate) fn udp_source(
                                     transition_complete = true;
                                     break;
                                 }
+
+                                handoff
+                                    .maybe_send_termination(&socket, multi_addr, server, &fcc)
+                                    .await;
                                 continue;
                             }
 
@@ -1364,32 +1366,19 @@ mod tests {
     }
 
     #[test]
-    fn fcc_switch_reason_gates_overlap_on_min_unicast_ms_then_switches_immediately() {
+    fn fcc_switch_reason_switches_immediately_on_overlap_and_respects_deadline() {
         let now = tokio::time::Instant::now();
         let started_100ms_ago = now - Duration::from_millis(100);
-        let started_500ms_ago = now - Duration::from_millis(500);
+        let armed_1000ms_ago = now - Duration::from_millis(1000);
+        let armed_2000ms_ago = now - FCC_SWITCH_DEADLINE;
 
-        // Unicast has already caught up (u_seq=1050 >= first_mcast=1000), but only 100ms < 500ms elapsed.
+        // Overlap fires immediately once u_seq >= first_mcast_seq, even before min_unicast_ms.
         assert_eq!(
             fcc_switch_reason(
                 Some(1050),
                 Some(1000),
                 Some(started_100ms_ago),
                 Some(started_100ms_ago),
-                Some(now),
-                20,
-                500,
-            ),
-            None
-        );
-
-        // As soon as 500ms has elapsed, overlap fires immediately without waiting 200ms for stall!
-        assert_eq!(
-            fcc_switch_reason(
-                Some(1050),
-                Some(1000),
-                Some(started_500ms_ago),
-                Some(started_500ms_ago),
                 Some(now),
                 20,
                 500,
@@ -1409,6 +1398,111 @@ mod tests {
                 5000,
             ),
             Some("buffer_cap")
+        );
+
+        // Deadline does NOT fire at 1000ms while unicast is active and below MAX_PENDING_MULTICAST_PACKETS.
+        assert_eq!(
+            fcc_switch_reason(
+                Some(900),
+                Some(1000),
+                Some(armed_1000ms_ago),
+                Some(armed_1000ms_ago),
+                Some(now),
+                20,
+                500,
+            ),
+            None
+        );
+
+        // Deadline does NOT fire at FCC_SWITCH_DEADLINE if unicast started and min_unicast_ms is not met.
+        assert_eq!(
+            fcc_switch_reason(
+                Some(900),
+                Some(1000),
+                Some(armed_2000ms_ago),
+                Some(armed_1000ms_ago),
+                Some(now),
+                20,
+                5000,
+            ),
+            None
+        );
+
+        // Deadline fires at FCC_SWITCH_DEADLINE once min_unicast_ms holds.
+        assert_eq!(
+            fcc_switch_reason(
+                Some(900),
+                Some(1000),
+                Some(armed_2000ms_ago),
+                Some(armed_1000ms_ago),
+                Some(now),
+                20,
+                500,
+            ),
+            Some("deadline")
+        );
+
+        // Deadline also fires at FCC_SWITCH_DEADLINE when unicast never started.
+        assert_eq!(
+            fcc_switch_reason(
+                None,
+                Some(1000),
+                Some(armed_2000ms_ago),
+                None,
+                None,
+                20,
+                5000,
+            ),
+            Some("deadline")
+        );
+    }
+
+    #[test]
+    fn fcc_switch_reason_triggers_stall_after_unicast_stall_timeout() {
+        let now = tokio::time::Instant::now();
+        let armed_100ms_ago = now - Duration::from_millis(100);
+        let stalled_unicast_at = now - FCC_UNICAST_STALL_TIMEOUT;
+
+        // Active unicast within FCC_UNICAST_STALL_TIMEOUT does not trigger stall.
+        assert_eq!(
+            fcc_switch_reason(
+                Some(900),
+                Some(1000),
+                Some(armed_100ms_ago),
+                Some(armed_100ms_ago),
+                Some(now),
+                20,
+                500,
+            ),
+            None
+        );
+
+        // Once last_unicast_at stops advancing for FCC_UNICAST_STALL_TIMEOUT, stall fires.
+        assert_eq!(
+            fcc_switch_reason(
+                Some(900),
+                Some(1000),
+                Some(stalled_unicast_at),
+                Some(stalled_unicast_at),
+                Some(stalled_unicast_at),
+                20,
+                5000,
+            ),
+            Some("stall")
+        );
+
+        // Never receiving unicast must not trigger stall.
+        assert_eq!(
+            fcc_switch_reason(
+                None,
+                Some(1000),
+                Some(stalled_unicast_at),
+                None,
+                None,
+                20,
+                500,
+            ),
+            None
         );
     }
 
