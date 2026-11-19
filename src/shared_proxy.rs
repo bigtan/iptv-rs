@@ -22,6 +22,7 @@ const MAX_PROXY_STREAMS: usize = 64;
 const BATCH_BYTES: usize = 16 * 1024;
 const BATCH_RESERVE_SLACK: usize = 2048;
 const BUFFER_CHUNKS: usize = 128;
+const MAX_BURST_CHUNKS: usize = 512;
 const PAT_LOOKBACK_CHUNKS: u64 = 64;
 const TS_PACKET_LEN: usize = 188;
 const BATCH_FLUSH: Duration = Duration::from_millis(2);
@@ -64,10 +65,13 @@ struct SharedProxyInner {
     next_seq: u64,
     last_pat_seq: Option<u64>,
     closed: bool,
+    next_receiver_id: u64,
+    receiver_cursors: Vec<(u64, u64)>,
 }
 
 pub(crate) struct SharedProxyReceiver {
     hub: Arc<SharedProxyHub>,
+    id: u64,
     next_seq: u64,
 }
 
@@ -250,6 +254,45 @@ fn contains_mpegts_pat(data: &[u8]) -> bool {
     })
 }
 
+impl SharedProxyInner {
+    fn update_cursor(&mut self, id: u64, next_seq: u64) {
+        if let Some(entry) = self
+            .receiver_cursors
+            .iter_mut()
+            .find(|(rx_id, _)| *rx_id == id)
+        {
+            entry.1 = next_seq;
+        }
+    }
+
+    fn remove_cursor(&mut self, id: u64) {
+        self.receiver_cursors.retain(|(rx_id, _)| *rx_id != id);
+    }
+
+    fn trim(&mut self) {
+        while self.chunks.len() > MAX_BURST_CHUNKS {
+            self.chunks.pop_front();
+        }
+        let min_cursor = self.receiver_cursors.iter().map(|&(_, seq)| seq).min();
+        while self.chunks.len() > BUFFER_CHUNKS {
+            let Some(front_seq) = self.chunks.front().map(|(s, _)| *s) else {
+                break;
+            };
+            if min_cursor.is_some_and(|c| front_seq >= c) {
+                break;
+            }
+            self.chunks.pop_front();
+        }
+        if let Some((first_seq, _)) = self.chunks.front()
+            && self
+                .last_pat_seq
+                .is_some_and(|pat_seq| pat_seq < *first_seq)
+        {
+            self.last_pat_seq = None;
+        }
+    }
+}
+
 impl SharedProxyHub {
     fn new() -> Self {
         Self {
@@ -258,6 +301,8 @@ impl SharedProxyHub {
                 next_seq: 0,
                 last_pat_seq: None,
                 closed: false,
+                next_receiver_id: 0,
+                receiver_cursors: Vec::new(),
             }),
             notify: Notify::new(),
             zero_receivers: Notify::new(),
@@ -267,11 +312,11 @@ impl SharedProxyHub {
 
     fn subscribe(self: &Arc<Self>) -> SharedProxyReceiver {
         self.receivers.fetch_add(1, Ordering::AcqRel);
-        let next_seq = self
+        let (id, start_seq) = self
             .inner
             .lock()
-            .map(|inner| {
-                if let Some(pat_seq) = inner.last_pat_seq
+            .map(|mut inner| {
+                let start_seq = if let Some(pat_seq) = inner.last_pat_seq
                     && let Some((first_seq, _)) = inner.chunks.front()
                     && pat_seq >= *first_seq
                     && inner.next_seq.saturating_sub(pat_seq) <= PAT_LOOKBACK_CHUNKS
@@ -279,12 +324,17 @@ impl SharedProxyHub {
                     pat_seq
                 } else {
                     inner.next_seq
-                }
+                };
+                let id = inner.next_receiver_id;
+                inner.next_receiver_id += 1;
+                inner.receiver_cursors.push((id, start_seq));
+                (id, start_seq)
             })
-            .unwrap_or(0);
+            .unwrap_or((0, 0));
         SharedProxyReceiver {
             hub: Arc::clone(self),
-            next_seq,
+            id,
+            next_seq: start_seq,
         }
     }
 
@@ -301,16 +351,7 @@ impl SharedProxyHub {
                 inner.last_pat_seq = Some(seq);
             }
             inner.chunks.push_back((seq, bytes));
-            while inner.chunks.len() > BUFFER_CHUNKS {
-                inner.chunks.pop_front();
-            }
-            if let Some((first_seq, _)) = inner.chunks.front()
-                && inner
-                    .last_pat_seq
-                    .is_some_and(|pat_seq| pat_seq < *first_seq)
-            {
-                inner.last_pat_seq = None;
-            }
+            inner.trim();
         }
         self.notify.notify_waiters();
     }
@@ -325,6 +366,11 @@ impl SharedProxyHub {
 
 impl Drop for SharedProxyReceiver {
     fn drop(&mut self) {
+        if let Ok(mut inner) = self.hub.inner.lock() {
+            inner.remove_cursor(self.id);
+            inner.trim();
+            drop(inner);
+        }
         if self.hub.receivers.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.hub.zero_receivers.notify_one();
         }
@@ -336,7 +382,7 @@ impl SharedProxyReceiver {
         loop {
             let notified = self.hub.notify.notified();
             {
-                let inner = self
+                let mut inner = self
                     .hub
                     .inner
                     .lock()
@@ -346,6 +392,8 @@ impl SharedProxyReceiver {
                 {
                     let lagged = *first_seq - self.next_seq;
                     self.next_seq = *first_seq;
+                    inner.update_cursor(self.id, self.next_seq);
+                    inner.trim();
                     return Err(SharedProxyRecvError::Lagged(lagged));
                 }
                 if let Some((first_seq, _)) = inner.chunks.front() {
@@ -353,8 +401,13 @@ impl SharedProxyReceiver {
                     if let Some((seq, bytes)) = inner.chunks.get(offset)
                         && *seq == self.next_seq
                     {
+                        let bytes = bytes.clone();
                         self.next_seq += 1;
-                        return Ok(bytes.clone());
+                        inner.update_cursor(self.id, self.next_seq);
+                        if inner.chunks.len() > BUFFER_CHUNKS {
+                            inner.trim();
+                        }
+                        return Ok(bytes);
                     }
                 }
                 if inner.closed {
@@ -467,13 +520,60 @@ mod tests {
     async fn reports_lag_after_buffer_rollover() {
         let hub = Arc::new(SharedProxyHub::new());
         let mut receiver = hub.subscribe();
-        for _ in 0..=BUFFER_CHUNKS {
+        for _ in 0..=MAX_BURST_CHUNKS {
             hub.push(Bytes::from_static(b"packet"));
         }
         assert!(matches!(
             receiver.recv().await,
             Err(SharedProxyRecvError::Lagged(1))
         ));
+    }
+
+    #[actix_web::test]
+    async fn burst_exceeding_steady_buffer_is_retained_without_lag_then_reclaimed() {
+        let hub = Arc::new(SharedProxyHub::new());
+        let mut receiver = hub.subscribe();
+        const BURST_CHUNKS: usize = 300;
+        const { assert!(BURST_CHUNKS > BUFFER_CHUNKS && BURST_CHUNKS < MAX_BURST_CHUNKS) };
+
+        for i in 0..BURST_CHUNKS {
+            hub.push(Bytes::from(i.to_string()));
+        }
+        assert_eq!(hub.inner.lock().unwrap().chunks.len(), BURST_CHUNKS);
+
+        for i in 0..BURST_CHUNKS {
+            let chunk = receiver
+                .recv()
+                .await
+                .expect("burst chunk should arrive without lag");
+            assert_eq!(chunk, Bytes::from(i.to_string()));
+        }
+
+        assert_eq!(hub.inner.lock().unwrap().chunks.len(), BUFFER_CHUNKS);
+    }
+
+    #[actix_web::test]
+    async fn dropping_slow_receiver_reclaims_burst_chunks() {
+        let hub = Arc::new(SharedProxyHub::new());
+        let mut receiver_a = hub.subscribe();
+        let receiver_b = hub.subscribe();
+        const BURST_CHUNKS: usize = 300;
+
+        for i in 0..BURST_CHUNKS {
+            hub.push(Bytes::from(i.to_string()));
+        }
+
+        for i in 0..BURST_CHUNKS {
+            let chunk = receiver_a
+                .recv()
+                .await
+                .expect("receiver A should drain burst without lag");
+            assert_eq!(chunk, Bytes::from(i.to_string()));
+        }
+
+        assert_eq!(hub.inner.lock().unwrap().chunks.len(), BURST_CHUNKS);
+        drop(receiver_b);
+        assert_eq!(hub.inner.lock().unwrap().chunks.len(), BUFFER_CHUNKS);
     }
 
     #[test]
